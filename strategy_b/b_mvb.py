@@ -28,6 +28,7 @@ import json
 import math
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 
@@ -399,18 +400,43 @@ FULL_DAY_MIN_LAST_BAR = hm("15:00")  # a ticker counts as "has full-day bars" if
 TRADE_COLS = list(TradeResult.__dataclass_fields__) + ["day", "ticker", "side", "rvol", "atr14", "reason"]
 
 
+CAL_STATE = {"strict": False, "source": "none (half days inferred from the last bar)"}
+
+
+@contextmanager
+def calendar_context(early: dict[str, str], strict: bool, source: str = ""):
+    """Install an early-close calendar for the duration of a run, then restore the previous state (no leaks
+    between runs or tests). strict=True: the calendar is COMPLETE for the range, so a file that ends at 12:59 on a
+    day the calendar calls a full day is a data gap, not a half day."""
+    saved = (dict(EARLY_CLOSES), dict(CAL_STATE))
+    EARLY_CLOSES.clear()
+    EARLY_CLOSES.update(early)
+    CAL_STATE.update(strict=strict, source=source or CAL_STATE["source"])
+    try:
+        yield
+    finally:
+        EARLY_CLOSES.clear()
+        EARLY_CLOSES.update(saved[0])
+        CAL_STATE.clear()
+        CAL_STATE.update(saved[1])
+
+
 def session_close_bar(day: str, m: pd.DataFrame) -> tuple[int | None, str]:
     """START time of the bar whose close we exit on: one bar before the official close (15:58 bar -> 15:59).
 
-    With an early-close calendar entry it is exact. Without one the close is inferred from the last bar in the
-    file: 15:59 -> full day, 12:59 -> half day. Anything else = a data gap; the day is skipped, never guessed.
+    With an early-close calendar entry it is exact (and the file must reach the bar before the close, else it is a
+    data gap). Without one the close is inferred from the last bar in the file: 15:59 -> full day, 12:59 -> half
+    day (only when no complete calendar is loaded). Anything else = a data gap; the day is skipped, never guessed.
     """
-    if day in EARLY_CLOSES:
-        return hm(EARLY_CLOSES[day]) - 2, "calendar"
     last = int(m["tmin"].max())
+    if day in EARLY_CLOSES:
+        close_bar = hm(EARLY_CLOSES[day]) - 1
+        if last < close_bar:
+            return None, "data_gap"
+        return close_bar - 1, "calendar"
     if last >= hm("15:59"):
         return hm("15:58"), "full"
-    if last == hm("12:59"):
+    if last == hm("12:59") and not CAL_STATE["strict"]:
         return hm("12:58"), "half_inferred"
     return None, "data_gap"
 
@@ -715,6 +741,18 @@ def gate_statistics(variants: list[Variant], results: list[pd.DataFrame], idx: d
 
 # ----------------------------------------------------------------------------- main
 def main(argv=None):
+    """Run, then restore the module-level calendar state (EARLY_CLOSES / CAL_STATE) whatever happens."""
+    saved = (dict(EARLY_CLOSES), dict(CAL_STATE))
+    try:
+        return _main(argv)
+    finally:
+        EARLY_CLOSES.clear()
+        EARLY_CLOSES.update(saved[0])
+        CAL_STATE.clear()
+        CAL_STATE.update(saved[1])
+
+
+def _main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--daily", required=True)
     ap.add_argument("--minutes", required=True)
@@ -728,7 +766,10 @@ def main(argv=None):
     ap.add_argument("--out", default="runs")
     ap.add_argument("--trial-log", default="experiments/trials.csv")
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--early-closes", default=None, help="CSV date,close (e.g. 2019-11-29,13:00)")
+    ap.add_argument("--early-closes", default="auto",
+                    help="'auto' (default) = bundled NYSE calendar (nyse_calendar.py) when the range is inside "
+                         "2015-2023; a CSV path date,close (e.g. 2019-11-29,13:00) = a complete calendar; "
+                         "'none' = infer half days from the last bar")
     ap.add_argument("--ticks", default=None, help="ticks.csv from `fetch_b_data.py ticks`: resolves same-minute "
                                                   "entry+stop trades from real prints")
     ap.add_argument("--gate-reps", type=int, default=1000, help="bootstrap / random-skip repetitions (DSR/SPA/PBO)")
@@ -755,9 +796,22 @@ def main(argv=None):
                          "A second look needs a new preregistration (v2) and a fresh holdout period.")
         if len(variants) > 3:
             sys.exit("HOLDOUT GUARD: at most base + 2 promoted variants may run on the holdout.")
-    if a.early_closes:
+    holiday_days: set[str] = set()
+    EARLY_CLOSES.clear()
+    if a.early_closes == "auto":
+        import nyse_calendar as NC
+        if NC.COVERED[0] <= int(a.start[:4]) and int(a.end[:4]) <= NC.COVERED[1]:
+            EARLY_CLOSES.update(NC.early_close_map(a.start, a.end))
+            holiday_days = NC.holiday_set(a.start, a.end)
+            CAL_STATE.update(strict=True, source=f"bundled {NC.COVERED[0]}-{NC.COVERED[1]} (nyse_calendar.py)")
+        else:
+            CAL_STATE.update(strict=False, source="none: range outside 2015-2023, half days inferred from the last bar")
+    elif a.early_closes and a.early_closes != "none":
         ec = pd.read_csv(a.early_closes, dtype=str)
         EARLY_CLOSES.update(dict(zip(pd.to_datetime(ec.iloc[:, 0]).dt.strftime("%Y-%m-%d"), ec.iloc[:, 1])))
+        CAL_STATE.update(strict=True, source=f"file {a.early_closes}")
+    else:
+        CAL_STATE.update(strict=False, source="none (half days inferred from the last bar)")
 
     files = {d: p for d, p in minute_files(a.minutes).items()}
     # history needs days before --start for the 14-day baselines; trading only inside [start, end]
@@ -803,7 +857,8 @@ def main(argv=None):
         for rep in range(a.nulls):
             add(("null", mode, rep), (variants[0], mode, a.seed + 1000 * rep))
     print(f"running {len(specs)} specs over {len(trade_files)} days (each day file read once)", flush=True)
-    diag: dict = {}
+    diag: dict = {"calendar": CAL_STATE["source"], "holiday_files": sorted(set(trade_files) & holiday_days),
+                  "early_closes_in_range": sorted(d for d in EARLY_CLOSES if d in trade_files)}
     results = run_many(specs, trade_files, ot, dfe, diag)
 
     rows, all_tr = [], []
@@ -902,8 +957,13 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
          "", "| " + " | ".join(c[1] for c in cols) + " |", "|" + "---|" * len(cols)]
     gaps = diag.get("days_skipped_data_gap", [])
     pools = diag.get("null_pool_sizes", [])
-    warn = [f"- Days skipped as data gaps (last bar not 15:59 / 12:59, no calendar entry): {len(gaps)}"
+    warn = [f"- Days skipped as data gaps (last bar does not match the session close): {len(gaps)}"
             + (f" e.g. {gaps[:5]}" if gaps else "")]
+    if "calendar" in diag:
+        hol = diag.get("holiday_files", [])
+        warn.append(f"- NYSE calendar: {diag['calendar']}. Early closes in range: "
+                    f"{len(diag.get('early_closes_in_range', []))}. Minute files on NYSE holidays: {len(hol)}"
+                    + (f" {hol[:5]} (data error: a closed market has no bars)" if hol else ""))
     if pools:
         warn.append(f"- random_names null pool = universe names WITH full-day bars: median {int(np.median(pools))}/day. "
                     "If full-day bars exist only for top-RVOL names, this null is NOT random and H2 is untested "

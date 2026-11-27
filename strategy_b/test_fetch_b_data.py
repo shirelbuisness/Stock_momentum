@@ -180,3 +180,12 @@ def test_ticks_decide_unit():
     assert B.ticks_decide(np.array([9.9, 10.00]), 1, 10.00, 9.80) is None
     # short mirror: trigger 10.00 (long space -10.00), stop 10.20 (long space -10.20)
     assert B.ticks_decide(np.array([10.1, 9.99, 10.21]), -1, -10.00, -10.20) is True
+
+
+def test_validate_lists_calendar_warnings_without_failing_the_gate(downloaded):
+    data, _, _ = downloaded
+    rep = F.stage_validate(data)
+    cal = rep[rep["file"] == "calendar"]
+    # the synthetic market uses business days, so MLK day and Presidents' Day 2019 have files
+    assert {"2019-01-21", "2019-02-18"} <= set(cal["day"])
+    assert cal["problem"].str.startswith("WARN").all()

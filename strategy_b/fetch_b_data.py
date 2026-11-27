@@ -429,7 +429,14 @@ def stage_validate(data_dir, max_bad_share=0.01):
     mdir = os.path.join(data_dir, "minutes")
     days = sorted(f[8:18] for f in os.listdir(mdir) if f.startswith("minutes_") and f.endswith(".csv"))
     bad_days = 0
+    import nyse_calendar as NC
     for day in days:
+        # calendar cross-check (WARN only: listed in validation.csv, not counted by the gate; b_mvb.py skips a
+        # half-day mismatch as a data gap when the bundled calendar is active)
+        y = int(day[:4])
+        if NC.COVERED[0] <= y <= NC.COVERED[1]:
+            if day in NC.holiday_set(day, day):
+                probs.append(("calendar", day, "WARN minute file on an NYSE holiday"))
         m = pd.read_csv(os.path.join(mdir, f"minutes_{day}.csv"), dtype={"ticker": str, "time": str})
         issues = []
         if m.duplicated(["ticker", "time"]).any():
@@ -443,6 +450,10 @@ def stage_validate(data_dir, max_bad_share=0.01):
             issues.append("SPY missing or first bar not 09:30")
         elif spy["time"].max() not in ("09:44", "12:59", "15:59"):
             issues.append(f"SPY last bar {spy['time'].max()} (not a full/half day)")
+        elif NC.COVERED[0] <= int(day[:4]) <= NC.COVERED[1] and spy["time"].max() != "09:44":
+            want = "12:59" if day in NC.early_close_map(day, day) else "15:59"
+            if spy["time"].max() != want:
+                probs.append(("calendar", day, f"WARN SPY last bar {spy['time'].max()}, NYSE calendar says {want}"))
         if issues:
             bad_days += 1
             probs.append(("minutes", day, "; ".join(issues)))
@@ -450,7 +461,8 @@ def stage_validate(data_dir, max_bad_share=0.01):
     atomic_csv(rep, os.path.join(data_dir, "validation.csv"))
     share = bad_days / max(1, len(days))
     print(f"validate: {len(days)} minute files, {bad_days} with problems ({share:.1%}); daily problems: "
-          f"{sum(1 for p in probs if p[0] == 'daily')} -> data/validation.csv")
+          f"{sum(1 for p in probs if p[0] == 'daily')}; calendar warnings: "
+          f"{sum(1 for p in probs if p[0] == 'calendar')} -> data/validation.csv")
     if share > max_bad_share or any(p[0] == "daily" for p in probs):
         sys.exit("DATA GATE FAILED: fix the problems in data/validation.csv before backtesting")
     print("DATA GATE PASSED")
