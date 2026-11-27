@@ -35,6 +35,12 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] y) pandas future-proofing: `fillna(False)` on float columns (Pandas4Warning in CI; would raise on a future pandas)
 
 ## Next (for the next session)
-- [ ] z1) With keys: `python run_dev_a.py` → read the draft `docs/results-DEV-A.md` with Shirel
-- [ ] z2) A paper shadow logger that writes `paper_trades.csv` / `paper_fills.csv` / `live_selection.csv` in the formats `paper_gate_b.py` and `paper_vs_cone.py` read (no order code; needs the order-risk skill review first)
+- [x] z1) SKIPPED in session 3 (no keys in env) — With keys: `python run_dev_a.py` → read the draft `docs/results-DEV-A.md` with Shirel
+- [x] z2) A paper shadow logger that writes `paper_trades.csv` / `paper_fills.csv` / `live_selection.csv` in the formats `paper_gate_b.py` and `paper_vs_cone.py` read (no order code; needs the order-risk skill review first)
 - [ ] z3) Measure real-data runtime of DEV-A and of `--nulls-all-versions` on the holdout sizes
+
+## Refill 23:10 UTC, session 3 (z1 skipped: no keys; z3 needs real data)
+- [x] z2) `shadow_day_b.py`: paper shadow logger WITHOUT orders: 09:35 selection (as the dry run) + after the close the day's SIP bars → the backtest's own fill model → appends `paper_trades.csv` + `live_selection.csv` (formats of paper_gate_b / paper_vs_cone); parity test vs the backtest; selection feed iex|sip (live free plan ranks on IEX)
+- [x] aa) Spread calibration from SIP quotes (cost model: "3 bp until calibrated"): `fetch_b_data.py quotes --trades <run>/trades.csv` (NBBO in a window around each entry and exit minute, market data only) + `spread_b.py` → measured half spread in bp (median / by price bucket) with tests; applying it stays a team decision
+- [x] ab) Rehearsal: shadow logger over many synthetic DEV days → `paper_gate_b.py` end to end (overlap and expectancy checks pass on honest data, fail on a planted bug)
+- [ ] ac) Boss review #6 + docs refresh (CLAUDE.md, runbook, build log Round 6)

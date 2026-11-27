@@ -51,9 +51,9 @@ def _code_sha() -> str:
         return "unknown"
 
 
-def fetch_today_opening(client, day: str, symbols: list[str]) -> pd.DataFrame:
+def fetch_today_opening(client, day: str, symbols: list[str], feed: str = "sip") -> pd.DataFrame:
     """1-min bars of `day` that have CLOSED by 09:35 (request end = 09:35:00, then a hard filter on bar start)."""
-    df = F.bars_frames(client, symbols, "1Min", F.ny_to_utc(day, "09:30"), F.ny_to_utc(day, DECISION_TIME))
+    df = F.bars_frames(client, symbols, "1Min", F.ny_to_utc(day, "09:30"), F.ny_to_utc(day, DECISION_TIME), feed=feed)
     rows = F.minutes_to_file_rows(df)
     if rows.empty:
         return pd.DataFrame(columns=["ticker", "time", "o", "h", "l", "c", "v"])
@@ -72,8 +72,10 @@ def fetch_today_split(client, day: str, symbols: list[str]) -> dict[str, float]:
     return out
 
 
-def select(data_dir: str, day: str, k: B.Knobs, today: pd.DataFrame, today_split: dict[str, float]) -> pd.DataFrame:
-    """The backtest's own selection on (history before `day`) + (today's bars closed by 09:35)."""
+def prepare(data_dir: str, day: str, k: B.Knobs, today: pd.DataFrame, today_split: dict[str, float],
+            minutes_dir: str | None = None):
+    """(ot, dfe, daily_before_day): the backtest's opening table with RVOL and daily features for `day`, built from
+    history before `day` + today's bars closed by 09:35. select() ranks on it; shadow_day_b.py simulates on it."""
     daily = pd.read_csv(os.path.join(data_dir, "daily.csv"), dtype={"ticker": str})
     daily = daily[daily["date"] < day]
     # placeholder row for day D: only the split factor is known (prices are not used: features use days < D)
@@ -83,24 +85,44 @@ def select(data_dir: str, day: str, k: B.Knobs, today: pd.DataFrame, today_split
     dfe = B.daily_features(B.load_daily_df(pd.concat([daily, ph], ignore_index=True)), k.hist_days)
     tmp = tempfile.mkdtemp(prefix="dryrun_")
     try:
-        hist_files = {d: p for d, p in B.minute_files(os.path.join(data_dir, "minutes")).items() if d < day}
+        mdir = minutes_dir or os.path.join(data_dir, "minutes")          # the RVOL baseline (same feed as today!)
+        hist_files = {d: p for d, p in B.minute_files(mdir).items() if d < day}
         hist_files = dict(list(hist_files.items())[-(k.hist_days + 5):])       # the RVOL window + slack
         p_today = os.path.join(tmp, f"minutes_{day}.csv")
         today.to_csv(p_today, index=False)
         files = {**hist_files, day: p_today}
         ot = B.add_rvol(B.opening_table(files, {k.or_minutes}), dfe, k.hist_days, k.min_hist_days)
-        otd = ot[ot["day"] == day]
-        dfd = dfe[dfe["date"] == day]
-        cand = B.day_candidates(otd, dfd, k)
-        if k.spy_filter:
-            spy = otd[(otd["ticker"] == "SPY") & (otd["L"] == k.or_minutes)]
-            spy_prev = daily[daily["ticker"] == "SPY"].sort_values("date")["close"]
-            if spy.empty or spy_prev.empty:
-                return cand.head(0)
-            cand = cand[cand["side"] == np.sign(spy["c"].iloc[0] - spy_prev.iloc[-1])]
-        return cand
+        return ot[ot["day"] == day], dfe[dfe["date"] == day], daily
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def spy_prev_close(daily_before: pd.DataFrame) -> float:
+    s = daily_before[daily_before["ticker"] == "SPY"].sort_values("date")["close"]
+    return float(s.iloc[-1]) if len(s) else float("nan")
+
+
+def select(data_dir: str, day: str, k: B.Knobs, today: pd.DataFrame, today_split: dict[str, float]) -> pd.DataFrame:
+    """The backtest's own selection on (history before `day`) + (today's bars closed by 09:35)."""
+    otd, dfd, daily = prepare(data_dir, day, k, today, today_split)
+    cand = B.day_candidates(otd, dfd, k)
+    if k.spy_filter:
+        spy = otd[(otd["ticker"] == "SPY") & (otd["L"] == k.or_minutes)]
+        prev = spy_prev_close(daily)
+        if spy.empty or not np.isfinite(prev):
+            return cand.head(0)
+        cand = cand[cand["side"] == np.sign(spy["c"].iloc[0] - prev)]
+    return cand
+
+
+def day_universe(data_dir: str, day: str) -> list[str]:
+    """The loose universe for `day` from daily.csv rows dated before `day` (what the opening stage downloads)."""
+    daily = pd.read_csv(os.path.join(data_dir, "daily.csv"), dtype={"ticker": str})
+    # loose_universe() keys on rows dated `day`: append a copy of the last prior session dated D, so its
+    # shift(1)/rolling inputs are exactly the sessions before D
+    prior = daily[daily["date"] < day]
+    last = prior["date"].max()
+    return F.loose_universe(pd.concat([prior, prior[prior["date"] == last].assign(date=day)]), [day])[day]
 
 
 def intents(cand: pd.DataFrame, day: str, variant_id: str, k: B.Knobs, equity: float, risk_pct: float) -> pd.DataFrame:
@@ -153,12 +175,7 @@ def main(argv=None, client=None):
     client = client or F.Client()
     if not client.key and client.transport == F.Client._urllib:
         sys.exit("set APCA_API_KEY_ID and APCA_API_SECRET_KEY (market data only)")
-    daily = pd.read_csv(os.path.join(a.data, "daily.csv"), dtype={"ticker": str})
-    # loose_universe() keys on rows dated `day`: append a copy of the last prior session dated D, so its
-    # shift(1)/rolling inputs are exactly the sessions before D (the same universe the opening stage downloads)
-    prior = daily[daily["date"] < a.day]
-    last = prior["date"].max()
-    uni = F.loose_universe(pd.concat([prior, prior[prior["date"] == last].assign(date=a.day)]), [a.day])[a.day]
+    uni = day_universe(a.data, a.day)
     syms = sorted(set(uni) | {"SPY"})
     split = fetch_today_split(client, a.day, syms)
     today = fetch_today_opening(client, a.day, syms)

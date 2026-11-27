@@ -10,6 +10,10 @@ Stages (each is resumable; finished pieces are skipped on rerun):
   fullday   Stage 2: full-session 1-min bars for the top-100 RVOL names + 30 seeded random eligible names + SPY.
   ticks     For trades whose entry and stop fall in the same minute (from a b_mvb run's trades.csv), download the
             tick prints of that minute so the backtest can see which came first (build log finding R9).
+  quotes    SIP NBBO quotes in the first --window-s seconds of every entry and exit minute of a run's trades
+            (seeded sample with --sample) -> data/quotes_spread.csv: the measured spread at the moment the
+            model trades, for the cost calibration (spread_b.py). The cost model's 3 bp half spread is an
+            assumption until this is measured.
 
 Keys: environment APCA_API_KEY_ID and APCA_API_SECRET_KEY (a free Alpaca account is enough).
 Everything is written under --data (default ./data). Nothing in the output depends on today's date except
@@ -153,8 +157,9 @@ class Manifest:
         os.replace(tmp, self.path)
 
 
-def bars_frames(client, symbols, timeframe, start, end, asof=None, batch=500, limit=10000):
-    """Multi-symbol bars -> DataFrame(ticker, ts_utc, o,h,l,c,v). Raw prices, SIP feed.
+def bars_frames(client, symbols, timeframe, start, end, asof=None, batch=500, limit=10000, feed="sip"):
+    """Multi-symbol bars -> DataFrame(ticker, ts_utc, o,h,l,c,v). Raw prices, SIP feed (feed="iex" only for the
+    paper shadow logger's live-like 09:35 ranking: the free plan cannot read SIP within the last 15 minutes).
 
     Symbol identity: every stage uses Alpaca's DEFAULT mapping (asof = today), so a company keeps ONE ticker across
     the daily file, the minute files and the ticks. Passing asof=<day> in some stages but not others would label the
@@ -162,7 +167,7 @@ def bars_frames(client, symbols, timeframe, start, end, asof=None, batch=500, li
     out = []
     for group in chunks(list(symbols), batch):
         params = dict(symbols=",".join(group), timeframe=timeframe, start=start, end=end, limit=limit,
-                      adjustment="raw", feed="sip", asof=asof, sort="asc")
+                      adjustment="raw", feed=feed, asof=asof, sort="asc")
         for page in client.paged(DATA_URL, "/v2/stocks/bars", params, "bars"):
             for sym, rows in page.items():
                 for b in rows:
@@ -422,6 +427,67 @@ def stage_ticks(client, data_dir, trades_csv, only_same_bar=True):
     print(f"ticks: {len(need)} ambiguous trades, {len(new)} prints stored -> {out_path}")
 
 
+QUOTE_COLS = ["day", "ticker", "minute", "leg", "n_quotes", "spread_bp_median", "spread_usd_median", "mid_median"]
+
+
+def quote_spreads(quotes: list[dict]) -> dict | None:
+    """Median NBBO spread of a list of Alpaca quotes (bp of the mid and $). Drops one-sided, locked and crossed
+    quotes (bp <= 0, ap <= bp): they are not a market a stop order could fill against."""
+    bp = np.array([float(q.get("bp", 0) or 0) for q in quotes])
+    ap_ = np.array([float(q.get("ap", 0) or 0) for q in quotes])
+    ok = (bp > 0) & (ap_ > bp)
+    if not ok.any():
+        return None
+    mid, spr = (ap_[ok] + bp[ok]) / 2, ap_[ok] - bp[ok]
+    return dict(n_quotes=int(ok.sum()), spread_bp_median=float(np.median(spr / mid * 1e4)),
+                spread_usd_median=float(np.median(spr)), mid_median=float(np.median(mid)))
+
+
+def stage_quotes(client, data_dir, trades_csv, window_s=10, sample=None, seed=7, open_holdout=False):
+    """NBBO in [minute, minute + window_s s) for each entry and exit minute of the run's filled trades."""
+    tr = pd.read_csv(trades_csv, dtype={"ticker": str})
+    tr = tr[tr["filled"].astype(bool)]
+    if "variant" in tr:
+        tr = tr.drop_duplicates(["day", "ticker", "entry_t", "exit_t"])
+    if not open_holdout and (tr["day"] >= "2024-01-01").any():
+        sys.exit("HOLDOUT GUARD: the trades file has 2024+ days.")
+    if sample and len(tr) > sample:
+        tr = tr.sample(n=sample, random_state=seed)
+    legs = pd.concat([tr[["day", "ticker"]].assign(minute=tr["entry_t"].astype(int), leg="entry"),
+                      tr[["day", "ticker"]].assign(minute=tr["exit_t"].astype(int), leg="exit")],
+                     ignore_index=True).drop_duplicates(["day", "ticker", "minute"])
+    out_path = os.path.join(data_dir, "quotes_spread.csv")
+    old = pd.read_csv(out_path, dtype={"ticker": str}) if os.path.exists(out_path) else pd.DataFrame(columns=QUOTE_COLS)
+    have = set(zip(old["day"], old["ticker"], old["minute"].astype(int)))
+    rows = []
+    for (day, minute), grp in legs.groupby(["day", "minute"]):
+        syms = sorted(s for s in grp["ticker"] if (day, s, int(minute)) not in have)
+        if not syms:
+            continue
+        leg_of = dict(zip(grp["ticker"], grp["leg"]))
+        hhmm = f"{int(minute) // 60:02d}:{int(minute) % 60:02d}"
+        start = ny_to_utc(day, hhmm)
+        end = (datetime.fromisoformat(start.replace("Z", "+00:00")) + timedelta(seconds=window_s)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        got: dict[str, list] = {}
+        for page in client.paged(DATA_URL, "/v2/stocks/quotes",
+                                 dict(symbols=",".join(syms), start=start, end=end, limit=10000, feed="sip",
+                                      sort="asc"), "quotes"):
+            for sym, qs in page.items():
+                got.setdefault(sym, []).extend(qs)
+        for sym in syms:
+            st = quote_spreads(got.get(sym, []))
+            rows.append(dict(day=day, ticker=sym, minute=int(minute), leg=leg_of[sym],
+                             **(st or dict(n_quotes=0, spread_bp_median=np.nan, spread_usd_median=np.nan,
+                                           mid_median=np.nan))))
+    new = pd.DataFrame(rows, columns=QUOTE_COLS)
+    allq = pd.concat([x for x in (old, new) if len(x)], ignore_index=True) if len(old) or len(new) else new
+    atomic_csv(allq.sort_values(["day", "ticker", "minute"]) if len(allq) else allq, out_path)
+    print(f"quotes: {len(legs)} trade legs, {len(new)} new rows ({int((new['n_quotes'] == 0).sum())} without a "
+          f"two-sided quote) -> {out_path}")
+    return out_path
+
+
 def identity_breaks(d: pd.DataFrame, jump: float = 3.0, gap_days: int = 30, gap_move: float = 0.5) -> pd.DataFrame:
     """Likely ticker reuse / identity breaks in the raw daily bars (known open issue: today's symbol mapping can
     glue two companies together). Per ticker, in date order, after undoing a split on its ex-date:
@@ -507,11 +573,14 @@ def stage_validate(data_dir, max_bad_share=0.01):
 # ----------------------------------------------------------------------------- CLI
 def main(argv=None, client=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["probe", "assets", "daily", "opening", "fullday", "validate", "ticks"])
+    ap.add_argument("stage", choices=["probe", "assets", "daily", "opening", "fullday", "validate", "ticks",
+                                          "quotes"])
     ap.add_argument("--data", default="data")
     ap.add_argument("--start", default="2015-11-01")
     ap.add_argument("--end", default="2023-12-31")
-    ap.add_argument("--trades", help="trades.csv of a b_mvb run (for `ticks`)")
+    ap.add_argument("--trades", help="trades.csv of a b_mvb run (for `ticks` and `quotes`)")
+    ap.add_argument("--window-s", type=int, default=10, help="quotes: seconds from the start of each minute")
+    ap.add_argument("--sample", type=int, default=None, help="quotes: seeded sample of N trades")
     ap.add_argument("--top", type=int, default=100)
     ap.add_argument("--random", type=int, default=30)
     ap.add_argument("--open-holdout", action="store_true", help="allow downloading dates >= 2024-01-01")
@@ -539,6 +608,11 @@ def main(argv=None, client=None):
         if not a.trades:
             sys.exit("--trades runs/<run>/trades.csv required")
         return stage_ticks(client, a.data, a.trades)
+    if a.stage == "quotes":
+        if not a.trades:
+            sys.exit("--trades runs/<run>/trades.csv required")
+        return stage_quotes(client, a.data, a.trades, window_s=a.window_s, sample=a.sample,
+                            open_holdout=a.open_holdout)
 
 
 if __name__ == "__main__":
