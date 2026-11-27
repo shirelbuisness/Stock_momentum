@@ -10,6 +10,16 @@ python -m pytest -q             # must print "112 passed" before touching the re
 ```
 (Windows PowerShell: `$env:APCA_API_KEY_ID="..."` instead of `export`.)
 
+## One command (steps 1–5 below, in order)
+```
+python run_dev_a.py          # probe → assets → daily → opening → fullday → validate → DEV-A → ticks → rerun → shortlist
+```
+- Stops at a probe NO-GO (exit 2) or a failed data gate, and still writes the draft.
+- Writes a DRAFT `docs/results-DEV-A.md` from the run's own files (probe output, data gate, sanity gate, base, versions, SPA/PBO, nulls, market beta, shortlist). Read it together; it is not a verdict.
+- DEV-A runs use `--nulls 20 --stress --replication` (+ `--securities` when present); `--breakeven` is optional (≈ 5× runtime).
+- No holdout option exists in this tool; `--dl-end` / `--end` ≥ 2024 are refused.
+- Rehearsed end-to-end against the fake Alpaca in `test_run_dev_a.py`.
+
 ## 1. Probe: 5 minutes, decides GO / NO-GO
 `python fetch_b_data.py probe`
 
@@ -56,11 +66,15 @@ python b_mvb.py ... same as step 3 ... --ticks data/ticks.csv
 - The report column "of which resolved by ticks %" should be close to 100%. Whatever is not resolved stays pessimistic.
 - **Decide between base and the stop variants only on the tick-resolved run.**
 
-## 5. Shortlist and confirm (mechanical)
+## 5. Shortlist, confirm, pass gate (mechanical)
 ```
 python gate_b.py shortlist --dev-a runs/<DEV-A tick-resolved run>
 python gate_b.py confirm   --dev-a runs/<DEV-A run> --dev-b runs/<DEV-B run with --stress>
+# only after signing, on the ONE holdout run (needs --stress --breakeven --nulls 20 --nulls-all-versions):
+python gate_b.py holdout   --run runs/<holdout run> --net-r-bar 0.05|0.08 --breakeven-ticks-bar 1|2
 ```
+- `holdout` has no default for the two open prereg choices. `--rehearse` runs it on a DEV run as a dress rehearsal.
+- New report sections (night 27.11, session 2): **B0-replication sanity gate** (`--replication`; long + short, commission only, Sharpe ≥ 2.0 over DEV), **market exposure** of the base vs SPY (beta, SPY-down days, F8 red-signal days), mean net R without the top-5 tickers.
 Stop versions are only shortlisted from a `--ticks` run (R9); SPA p > 0.10 empties the shortlist (plan v3).
 
 ## 6. Optional tools
