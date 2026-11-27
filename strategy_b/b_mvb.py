@@ -982,6 +982,7 @@ def _main(argv=None):
     daily = load_daily(a.daily)
     dfe = daily_features(daily, hist)
     spy = daily[daily["ticker"] == "SPY"].sort_values("date")
+    SPY_PREV.clear()                      # module state: never carry a previous run's SPY closes into this one
     SPY_PREV.update(dict(zip(spy["date"].iloc[1:], spy["close"].iloc[:-1])))
     ot = opening_table({d: p for d, p in files.items() if d <= a.end}, or_lens)
     ot = add_rvol(ot, dfe, hist, variants[0].knobs.min_hist_days)
