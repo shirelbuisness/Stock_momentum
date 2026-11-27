@@ -349,3 +349,55 @@ def test_scratches_are_counted_apart_from_wins_and_losses():
     assert s["scratch_pct"] == pytest.approx(3 / 6)
     assert s["win_pct_ex_scratch"] == pytest.approx(1 / 6) and s["loss_pct_ex_scratch"] == pytest.approx(2 / 6)
     assert s["scratch_sum_R"] == pytest.approx(0.01)
+
+
+# ------------------------------------------------------------------ night 27.11: short shadow (SSR / ETB)
+def test_ssr_at_entry_known_answers():
+    b = B.Bars(bars([("09:30", 10.0, 10.1, 9.20, 9.3), ("09:35", 9.3, 9.4, 9.05, 9.1), ("09:36", 9.1, 9.2, 8.95, 9.0)]))
+    row = {"prev_close_t": 10.0, "ssr_carry": False}
+    assert not B.ssr_at_entry(b, B.hm("09:35"), row)             # lowest print by 09:35 = 9.05 > 9.00
+    assert B.ssr_at_entry(b, B.hm("09:36"), row)                 # the entry bar itself reaches 8.95 (inclusive)
+    assert B.ssr_at_entry(b, B.hm("09:35"), {"prev_close_t": 10.0, "ssr_carry": True})   # carried from yesterday
+    assert not B.ssr_at_entry(b, B.hm("09:36"), {"prev_close_t": np.nan, "ssr_carry": False})
+
+
+def test_ssr_carry_comes_from_the_prior_session_only_and_ignores_splits():
+    days = list(pd.bdate_range("2020-01-01", periods=6).strftime("%Y-%m-%d"))
+    rows = []
+    for i, d in enumerate(days):
+        if i == 2:                                     # day 2: low 8.9 vs prior close 10 -> SSR trigger on day 2
+            rows.append(dict(ticker="X", date=d, open=10, high=10, low=8.9, close=9.5, volume=1, split_factor=1.0))
+        elif i == 4:                                   # day 4: a 2:1 split; raw low 4.9 is NOT a 51% drop
+            rows.append(dict(ticker="X", date=d, open=5, high=5.1, low=4.9, close=5, volume=1, split_factor=2.0))
+        else:
+            rows.append(dict(ticker="X", date=d, open=10, high=10.1, low=9.9, close=10, volume=1, split_factor=1.0))
+    f = B.daily_features(B.load_daily_df(pd.DataFrame(rows)), 2).set_index("date")
+    assert f["ssr_carry"].tolist() == [False, False, False, True, False, False]
+    assert f.loc[days[4], "prev_close_t"] == pytest.approx(5.0)          # 10 in the post-split scale
+
+
+def test_short_shadow_run_is_separate_flagged_and_logged(tmp_path):
+    make_market(str(tmp_path), n_tickers=40, n_days=45, seed=24, momentum=0.1)
+    sec = pd.DataFrame({"ticker": [f"T{i:03d}" for i in range(40)]})
+    sec["easy_to_borrow"] = [i % 4 != 0 for i in range(40)]
+    sec.to_csv(tmp_path / "securities.csv", index=False)
+    v = _write_variants(tmp_path, [{"id": "b", "knobs": {"min_avg_vol": 0}}])
+    args = ["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"), "--start", "2019-01-23",
+            "--end", "2019-12-31", "--nulls", "0", "--variants", v, "--gate-reps", "20",
+            "--securities", str(tmp_path / "securities.csv"), "--out", str(tmp_path / "runs"),
+            "--trial-log", str(tmp_path / "t.csv")]
+    out = B.main(args)
+    tr = pd.read_csv(os.path.join(out, "trades.csv"))
+    sh = tr[tr["variant"] == "b__shadow_short"]
+    assert len(sh) > 50 and (sh["side"] == -1).all() and (tr.loc[tr["variant"] == "b", "side"] == 1).all()
+    f = sh[sh["filled"]]
+    assert f["ssr"].notna().all() and f["etb"].notna().all()
+    assert set(f.loc[f["ticker"].isin(["T000", "T004"]), "etb"]) <= {False}
+    log = pd.read_csv(tmp_path / "t.csv")
+    assert list(log["variant_id"]) == ["b", "b__shadow_short"]                     # the shadow counts as a trial
+    s = pd.read_csv(os.path.join(out, "summary.csv"))
+    assert list(s["id"]) == ["b"]                                                 # never in the version table
+    rep = open(os.path.join(out, "report.md")).read()
+    assert "Short shadow (backtest only" in rep and "easy-to-borrow only" in rep
+    out2 = B.main(args[:-4] + ["--no-short-shadow", "--out", str(tmp_path / "r2"), "--trial-log", str(tmp_path / "t2.csv")])
+    assert "Short shadow" not in open(os.path.join(out2, "report.md")).read()

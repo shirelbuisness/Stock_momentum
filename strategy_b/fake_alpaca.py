@@ -73,7 +73,8 @@ class FakeAlpaca:
                 continue
             etf = t == "SPY"
             out.append(dict(symbol=t, name="SPDR S&P 500 ETF Trust" if etf else f"{t} Holdings Inc",
-                            exchange="ARCA" if etf else "NASDAQ", status=st, tradable=st == "active"))
+                            exchange="ARCA" if etf else "NASDAQ", status=st, tradable=st == "active",
+                            shortable=st == "active", easy_to_borrow=st == "active" and not t.endswith("7")))
         return out
 
     def _rows_bars(self, syms, tf, start, end):

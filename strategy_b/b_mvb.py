@@ -54,7 +54,7 @@ class Knobs:
     # signal / entry
     or_minutes: int = 5             # opening range length
     entry_bar2: bool = False        # F6: confirmation. Trigger = max(OR high, 2nd bar high), entries after bar 2
-    sides: str = "long"             # "long" | "both"
+    sides: str = "long"             # "long" | "both" | "short" (short = the backtest-only shadow)
     entry_cutoff: str = "15:58"     # last bar START at which an entry may trigger
     spy_filter: bool = False        # longs only if SPY prior close -> OR close return > 0 (shorts mirror)
     max_or_range_atr: float = 0.0   # 0 = off; skip if OR range > x * ATR (exhausted move)
@@ -151,7 +151,12 @@ def daily_features(d: pd.DataFrame, hist: int) -> pd.DataFrame:
     d["avgvol_overF"] = g["vol_over_F"].transform(lambda s: s.shift(1).rolling(hist, min_periods=hist).mean())
     d["atr14"] = d["atr_F"] / d["F"]
     d["avg_vol14"] = d["avgvol_overF"] * d["F"]
-    return d[["ticker", "date", "F", "atr14", "avg_vol14"]]
+    # short shadow only: SEC Rule 201 (SSR) is triggered by a trade >= 10% below the prior close and lasts the rest
+    # of that day AND the next day. ssr_carry(t) = the trigger happened on the prior session (known before 09:30).
+    d["prev_close_t"] = prev_close_scaled
+    trig = (d["low"] <= 0.9 * prev_close_scaled).astype(float).where(prev_close_scaled.notna())
+    d["ssr_carry"] = trig.groupby(d["ticker"], sort=False).shift(1).fillna(0.0).astype(bool)
+    return d[["ticker", "date", "F", "atr14", "avg_vol14", "prev_close_t", "ssr_carry"]]
 
 
 def minute_files(dirpath: str) -> dict[str, str]:
@@ -409,12 +414,15 @@ def day_candidates(ot_day: pd.DataFrame, dfe_day: pd.DataFrame, k: Knobs, merged
         x = x[loc >= k.close_loc_min]
     if k.sides == "long":
         x = x[x["side"] == 1]
+    elif k.sides == "short":
+        x = x[x["side"] == -1]
     return x
 
 
 SPY_PREV: dict[str, float] = {}   # day -> SPY prior-session close (raw), filled in main()
 EARLY_CLOSES: dict[str, str] = {}  # day -> "HH:MM" official close (e.g. "13:00"), optional calendar
 TICKS: dict[tuple, np.ndarray] = {}  # (day, ticker, minute) -> tick prices in time order (fetch_b_data.py ticks)
+BORROW: dict[str, bool] = {}  # ticker -> easy_to_borrow TODAY (securities.csv; labels the short shadow only)
 
 
 def load_ticks(path: str) -> int:
@@ -423,7 +431,7 @@ def load_ticks(path: str) -> int:
         TICKS[(key[0], key[1], int(key[2]))] = g["price"].to_numpy(dtype=float)
     return len(TICKS)
 FULL_DAY_MIN_LAST_BAR = hm("15:00")  # a ticker counts as "has full-day bars" if its last bar starts >= 15:00
-TRADE_COLS = list(TradeResult.__dataclass_fields__) + ["day", "ticker", "side", "rvol", "atr14", "reason"]
+TRADE_COLS = list(TradeResult.__dataclass_fields__) + ["day", "ticker", "side", "rvol", "atr14", "reason", "ssr", "etb"]
 
 
 CAL_STATE = {"strict": False, "source": "none (half days inferred from the last bar)"}
@@ -583,9 +591,25 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
                 d = asdict(res)
                 d.update(day=day, ticker=r["ticker"], side=side, rvol=r["rvol"], atr14=r["atr14"],
                          reason=res.exit_reason)
+                if side < 0:
+                    d.update(ssr=ssr_at_entry(bars, res.entry_t, r), etb=BORROW.get(r["ticker"], np.nan))
                 out_rows[si].append(d)
     diag.pop("_mb", None)
     return [_trades_df(r) for r in out_rows]
+
+
+def ssr_at_entry(bars: "Bars", entry_t: int, r) -> bool:
+    """True if Rule 201 is active when the short entry triggers: carried from the prior session, or any bar from
+    09:30 up to AND including the entry bar traded <= 90% of the prior close (inclusive = pessimistic: inside the
+    entry minute the order of trigger and SSR is unknown). Under SSR a short may only print ABOVE the national
+    best bid, so the modelled stop-market short entry is not executable as modelled."""
+    if bool(r.get("ssr_carry", False)):
+        return True
+    pc = r.get("prev_close_t", np.nan)
+    if not np.isfinite(pc):
+        return False
+    lows = bars.l[bars.t <= entry_t]
+    return bool(lows.size and lows.min() <= 0.9 * pc)
 
 
 def run_variant(var: Variant, files: dict[str, str], ot: pd.DataFrame, dfe: pd.DataFrame,
@@ -757,9 +781,43 @@ def breakeven_from(results: list[pd.DataFrame], xs: list[float] | None = None) -
     return np.inf
 
 
+# ----------------------------------------------------------------------------- short shadow
+def short_shadow_summary(tr: pd.DataFrame, all_days: list[str], top_n: int, a) -> dict:
+    """Backtest-only short shadow (prereg: B0-primary is long-only; shorts are a shadow with SSR/ETB flags).
+    Rows: all shorts; without SSR-flagged entries (not executable as modelled); ETB-only (TODAY's list);
+    borrow stress (bp/yr on notional for the holding day) with non-ETB names skipped."""
+    s = summarize(tr, all_days, top_n, a.scratch_r)
+    f = tr[tr["filled"]] if not tr.empty else tr
+    s["sets"] = []
+    if f.empty:
+        return s
+
+    def row(name, x):
+        t, _, G_ = clustered_t(x["r_net"], x["day"]) if len(x) else (np.nan, np.nan, 0)
+        return dict(set=name, trades=int(len(x)), mean_R_net=x["r_net"].mean() if len(x) else np.nan, t=t,
+                    win=float((x["r_net"] > 0).mean()) if len(x) else np.nan)
+
+    ssr = f["ssr"].fillna(False).astype(bool)
+    etb = f["etb"]
+    s["ssr_share"] = float(ssr.mean())
+    s["etb_known_share"] = float(etb.notna().mean())
+    s["sets"].append(row("all shorts", f))
+    s["sets"].append(row("without SSR-flagged entries", f[~ssr]))
+    if etb.notna().any():
+        ok = f[(~ssr) & (etb == True)].copy()                    # noqa: E712 (object column: True/False/NaN)
+        s["sets"].append(row("without SSR, easy-to-borrow only (today's list)", ok))
+        ok["r_net"] = ok["r_net"] - a.borrow_bp_yr / 1e4 / 360 * ok["entry_px"].abs() / ok["r_ps"]
+        s["sets"].append(row(f"same + borrow stress {a.borrow_bp_yr:g} bp/yr", ok))
+    else:
+        x = f[~ssr].copy()
+        x["r_net"] = x["r_net"] - a.borrow_bp_yr / 1e4 / 360 * x["entry_px"].abs() / x["r_ps"]
+        s["sets"].append(row(f"without SSR + borrow stress {a.borrow_bp_yr:g} bp/yr (ETB unknown)", x))
+    return s
+
+
 # ----------------------------------------------------------------------------- gate statistics
 def gate_statistics(variants: list[Variant], results: list[pd.DataFrame], idx: dict, rows: list[dict],
-                    all_days: list[str], a) -> dict:
+                    all_days: list[str], a, extra_trials=()) -> dict:
     """DSR (per version, N from the trial log + this run), random-skip null (filters), Hansen SPA (best vs base),
     PBO via CSCV (all versions). Writes dsr / rs_* into `rows` (the summary) and returns the run-level numbers."""
     import gate_stats as G
@@ -767,7 +825,7 @@ def gate_statistics(variants: list[Variant], results: list[pd.DataFrame], idx: d
     if os.path.exists(a.trial_log):
         log = pd.read_csv(a.trial_log, dtype=str)
         prev = log["sharpe_1x"].tolist() if "sharpe_1x" in log else [""] * len(log)
-    n_trials, var_sr = G.trial_sharpe_stats(prev, [s.get("sharpe_1x", "") for s in rows])
+    n_trials, var_sr = G.trial_sharpe_stats(prev, [s.get("sharpe_1x", "") for s in rows] + list(extra_trials))
     sr0 = G.expected_max_sharpe(n_trials, var_sr)
     base_tr = results[idx[("var", variants[0].id)]]
     bf = base_tr[base_tr["filled"]] if not base_tr.empty else base_tr
@@ -826,12 +884,22 @@ def _main(argv=None):
                          "'none' = infer half days from the last bar")
     ap.add_argument("--ticks", default=None, help="ticks.csv from `fetch_b_data.py ticks`: resolves same-minute "
                                                   "entry+stop trades from real prints")
+    ap.add_argument("--securities", default=None, help="securities.csv from fetch_b_data.py assets: TODAY's "
+                                                       "easy_to_borrow flags label the short shadow")
+    ap.add_argument("--no-short-shadow", action="store_true", help="skip the backtest-only short shadow of the base")
+    ap.add_argument("--borrow-bp-yr", type=float, default=30.0, help="borrow stress for the short shadow, bp/year")
     ap.add_argument("--scratch-r", type=float, default=SCRATCH_R, help="|net R| <= this counts as a scratch")
     ap.add_argument("--gate-reps", type=int, default=1000, help="bootstrap / random-skip repetitions (DSR/SPA/PBO)")
     ap.add_argument("--spa-block", type=float, default=10.0, help="mean block length (days) of the SPA bootstrap")
     ap.add_argument("--pbo-blocks", type=int, default=16, help="CSCV blocks for PBO (even)")
     a = ap.parse_args(argv)
     TICKS.clear()
+    BORROW.clear()
+    if a.securities:
+        sec = pd.read_csv(a.securities, dtype={"ticker": str})
+        if "easy_to_borrow" in sec:
+            ok = sec["easy_to_borrow"].notna()
+            BORROW.update(dict(zip(sec.loc[ok, "ticker"], sec.loc[ok, "easy_to_borrow"].astype(str).str.lower() == "true")))
     if a.ticks:
         print(f"ticks loaded for {load_ticks(a.ticks)} ambiguous minutes", flush=True)
 
@@ -912,6 +980,10 @@ def _main(argv=None):
                 if x == 0:
                     continue                      # identical to 0 ticks: reuse that run
                 add(("be_bp", v.id, x), sp)
+    shadow_id = variants[0].id + "__shadow_short"
+    if not a.no_short_shadow and variants[0].knobs.sides == "long":
+        add(("shadow_short",), (Variant(shadow_id, replace(variants[0].knobs, sides="short"),
+                                        "backtest-only short shadow of the base (never a verdict)"), "", 0))
     for mode in (["random_entry", "random_names"] if a.nulls > 0 else []):
         for rep in range(a.nulls):
             add(("null", mode, rep), (variants[0], mode, a.seed + 1000 * rep))
@@ -948,7 +1020,14 @@ def _main(argv=None):
         print(f"[{v.id}] trades={s.get('trades', 0)} meanR_net={s.get('mean_R_net', float('nan')):.3f} "
               f"t={s.get('t_net', float('nan')):.2f}", flush=True)
 
-    gate = gate_statistics(variants, results, idx, rows, all_days, a)
+    shadow = None
+    if ("shadow_short",) in idx:
+        sh_tr = results[idx[("shadow_short",)]]
+        shadow = short_shadow_summary(sh_tr, all_days, variants[0].knobs.top_n, a)
+        shadow["id"] = shadow_id
+        all_tr.append(sh_tr.assign(variant=shadow_id))
+    gate = gate_statistics(variants, results, idx, rows, all_days, a,
+                           extra_trials=[shadow.get("sharpe_1x", "")] if shadow else [])
 
     null_rows = []
     if a.nulls > 0:
@@ -982,13 +1061,14 @@ def _main(argv=None):
     with open(os.path.join(outdir, "expected_cone.json"), "w") as f:
         json.dump(dict(run=stamp, data_fingerprint=fp, start=a.start, end=a.end, versions=cones), f, indent=2)
     gate["cone_base"] = cones[variants[0].id]
+    gate["shadow"] = shadow
     write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
     with open(a.trial_log, "a") as f:
         if new:
             f.write("run_stamp,variant_id,start,end,trades,mean_R_net,t_net,sharpe_1x,data_fp\n")
-        for s in rows:
+        for s in rows + ([shadow] if shadow else []):     # the shadow is a backtest run too: it counts as a trial
             f.write(f"{stamp},{s['id']},{a.start},{a.end},{s.get('trades', 0)},{s.get('mean_R_net', '')},"
                     f"{s.get('t_net', '')},{s.get('sharpe_1x', '')},{fp}\n")
     print(f"\nreport: {os.path.join(outdir, 'report.md')}")
@@ -1088,6 +1168,17 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
               "| after N trades | cum R p5 | p50 | p95 | max DD R p5 | p50 | p95 |", "|---|---|---|---|---|---|---|"]
         for h, x in cone["horizons"].items():
             L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"]) + " |")
+    sh = gate.get("shadow")
+    if sh:
+        L += ["", "## Short shadow (backtest only; never a verdict, never traded)", "",
+              f"Base rules with sides = short. SSR-flagged = Rule 201 active at the entry (carried from the prior day, "
+              f"or a print ≤ 90% of the prior close by the entry minute): {fmt(100 * sh.get('ssr_share', np.nan), 1)}% "
+              f"of shorts. ETB flags known for {fmt(100 * sh.get('etb_known_share', np.nan), 1)}% "
+              "(Alpaca's list TODAY, optimistic for the past). Logged as one trial.", "",
+              "| set | trades | mean R net | t (day-clustered) | win% |", "|---|---|---|---|---|"]
+        for x in sh.get("sets", []):
+            L.append(f"| {x['set']} | {x['trades']} | {fmt(x['mean_R_net'])} | {fmt(x['t'], 2)} | "
+                     f"{fmt(100 * x['win'], 1) if np.isfinite(x['win']) else '–'} |")
     L += ["", "## Reading rules", "- Not preregistered yet: treat t < 3 as 'not worth pursuing' (rigor skill §5).",
           "- A variant beats the base only with t_vs_base > 2 AND wins again on the next period's fresh data.",
           "- Breakeven ticks/side < 2 → B as specified does not get deployed (plan §4).",

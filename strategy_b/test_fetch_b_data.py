@@ -189,3 +189,18 @@ def test_validate_lists_calendar_warnings_without_failing_the_gate(downloaded):
     # the synthetic market uses business days, so MLK day and Presidents' Day 2019 have files
     assert {"2019-01-21", "2019-02-18"} <= set(cal["day"])
     assert cal["problem"].str.startswith("WARN").all()
+
+
+def test_assets_keep_todays_borrow_flags(downloaded):
+    data, _, _ = downloaded
+    s = pd.read_csv(os.path.join(data, "securities.csv"), dtype={"ticker": str})
+    assert {"shortable", "easy_to_borrow"} <= set(s.columns)
+    assert "not as of the trade date" in open(os.path.join(data, "README_data.md")).read()
+
+
+def test_daily_includes_the_end_day_itself(market, tmp_path):
+    c = client_for(FakeAlpaca(market))
+    F.main(["assets", "--data", str(tmp_path)], client=c)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-02-21"], client=c)
+    d = pd.read_csv(tmp_path / "daily.csv")
+    assert d["date"].max() == "2019-02-21" and d["date"].min() == "2019-01-02"

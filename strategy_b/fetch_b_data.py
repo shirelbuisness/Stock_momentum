@@ -229,14 +229,18 @@ def stage_assets(client, data_dir):
         body = client.get(TRADING_URL, "/v2/assets", dict(status=status, asset_class="us_equity"))
         for a in body:
             rows.append(dict(ticker=a.get("symbol"), name=a.get("name") or "", exchange=a.get("exchange"),
-                             status=a.get("status"), tradable=a.get("tradable")))
+                             status=a.get("status"), tradable=a.get("tradable"),
+                             # TODAY's borrow flags (not point-in-time): used only to label the short shadow
+                             shortable=a.get("shortable"), easy_to_borrow=a.get("easy_to_borrow")))
     s = pd.DataFrame(rows).drop_duplicates("ticker")
     s["common"] = s["exchange"].isin(COMMON_EXCHANGES) & ~s["name"].str.contains(NON_COMMON) & \
         ~s["ticker"].str.contains(r"[./ ]", regex=True)
     atomic_csv(s, os.path.join(data_dir, "securities.csv"))
     note = ("# Data notes\n- securities.csv = Alpaca assets (active + inactive) as listed TODAY. Names delisted long ago "
             "may be missing -> results are partly survivor-biased. Cross-check with Massive Basic `active=false` "
-            "if available.\n- common = name/exchange heuristic; it also drops some 'Trust' operating companies.\n")
+            "if available.\n- common = name/exchange heuristic; it also drops some 'Trust' operating companies.\n"
+            "- shortable / easy_to_borrow = Alpaca's flags TODAY, not as of the trade date. They label the short "
+            "shadow only and are optimistic for the past (names that were hard to borrow then may be easy now).\n")
     with open(os.path.join(data_dir, "README_data.md"), "w") as f:
         f.write(note)
     print(f"securities: {len(s)} rows, {int(s['common'].sum())} common, {int((s['status'] == 'inactive').sum())} inactive")
@@ -265,7 +269,9 @@ def stage_daily(client, data_dir, start, end, batch=500):
         if man.done("daily", piece):
             continue
         s, e = max(start, f"{y}-01-01"), min(end, f"{y}-12-31")
-        df = bars_frames(client, syms, "1Day", s, e, batch=batch)
+        # explicit NY timestamps: a date-only `end` can be read as 00:00 UTC, which drops the end day itself
+        # (Dec 31 is a trading day in 2015 and 2018-2021). Night 27.11 finding.
+        df = bars_frames(client, syms, "1Day", ny_to_utc(s, "00:00"), ny_to_utc(e, "23:59"), batch=batch)
         if not df.empty:
             df["date"] = df["ts_utc"].map(lambda x: utc_to_ny(x).strftime("%Y-%m-%d"))
         atomic_csv(df, os.path.join(parts_dir, f"daily_{y}.csv"))

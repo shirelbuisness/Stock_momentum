@@ -45,6 +45,8 @@ def _ticks(tmp_path, minutes_dir, trades_csv):
 
 
 def _run(mod, tmp_path, tag, extra=("--breakeven",)):
+    if mod is B:
+        extra = (*extra, "--no-short-shadow")           # added after the freeze (task f); not in the reference
     return mod.main(["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"),
                      "--start", "2019-11-11", "--end", "2019-12-31", "--nulls", "2", "--stress",
                      "--gate-reps", "50", "--variants", _variants(tmp_path), "--out", str(tmp_path / f"runs_{tag}"),
@@ -53,6 +55,7 @@ def _run(mod, tmp_path, tag, extra=("--breakeven",)):
 
 def _same(out_a, out_b):
     ta, tb = pd.read_csv(f"{out_a}/trades.csv"), pd.read_csv(f"{out_b}/trades.csv")
+    ta = ta[tb.columns]                                   # columns added after the freeze (ssr, etb) are extra
     pd.testing.assert_frame_equal(ta, tb, check_exact=False, rtol=1e-12, atol=1e-12)
     sa, sb = pd.read_csv(f"{out_a}/summary.csv"), pd.read_csv(f"{out_b}/summary.csv")
     pd.testing.assert_frame_equal(sa, sb, check_exact=False, rtol=1e-12, atol=1e-12)
