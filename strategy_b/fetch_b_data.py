@@ -422,6 +422,28 @@ def stage_ticks(client, data_dir, trades_csv, only_same_bar=True):
     print(f"ticks: {len(need)} ambiguous trades, {len(new)} prints stored -> {out_path}")
 
 
+def identity_breaks(d: pd.DataFrame, jump: float = 3.0, gap_days: int = 30, gap_move: float = 0.5) -> pd.DataFrame:
+    """Likely ticker reuse / identity breaks in the raw daily bars (known open issue: today's symbol mapping can
+    glue two companies together). Per ticker, in date order, after undoing a split on its ex-date:
+      jump : open(t) / close(t-1) > `jump` or < 1/`jump` with no split that day (no single stock does that often);
+      gap  : > `gap_days` calendar days without a bar, then a level change > `gap_move` (a relisted / new company).
+    WARN only: a real 3x gap (biotech news) also shows up. The list is for a human spot check."""
+    out = []
+    x = d.sort_values(["ticker", "date"])
+    sf = x["split_factor"].fillna(1.0).replace(0, 1.0) if "split_factor" in x else pd.Series(1.0, index=x.index)
+    prev_close = x.groupby("ticker")["close"].shift(1) / sf
+    prev_date = pd.to_datetime(x.groupby("ticker")["date"].shift(1))
+    ratio = x["open"] / prev_close
+    gap = (pd.to_datetime(x["date"]) - prev_date).dt.days
+    j = ratio.notna() & ((ratio > jump) | (ratio < 1 / jump))
+    g = gap.notna() & (gap > gap_days) & ((ratio - 1).abs() > gap_move)
+    for kind, mask in (("jump", j), ("gap", g & ~j)):
+        for _, r in x[mask].assign(ratio=ratio[mask], gap=gap[mask]).iterrows():
+            out.append(dict(ticker=r["ticker"], date=r["date"], kind=kind, open_over_prev_close=round(r["ratio"], 3),
+                            days_since_prev_bar=int(r["gap"])))
+    return pd.DataFrame(out, columns=["ticker", "date", "kind", "open_over_prev_close", "days_since_prev_bar"])
+
+
 def stage_validate(data_dir, max_bad_share=0.01):
     """The data gate (plan): fail loudly before a backtest can run on broken data."""
     probs = []
@@ -432,6 +454,12 @@ def stage_validate(data_dir, max_bad_share=0.01):
         | (d["high"] < d[["open", "close"]].max(axis=1) - 1e-9)
     if bad_px.any():
         probs.append(("daily", "-", f"{int(bad_px.sum())} rows with impossible OHLC"))
+    ib = identity_breaks(d)
+    atomic_csv(ib, os.path.join(data_dir, "identity_warnings.csv"))
+    for _, r in ib.iterrows():
+        probs.append(("identity", r["date"], f"WARN {r['ticker']} {r['kind']}: open/prev close "
+                                             f"{r['open_over_prev_close']}, {r['days_since_prev_bar']} days since the "
+                                             "previous bar (ticker reuse? spot-check)"))
     mdir = os.path.join(data_dir, "minutes")
     days = sorted(f[8:18] for f in os.listdir(mdir) if f.startswith("minutes_") and f.endswith(".csv"))
     bad_days = 0
@@ -468,7 +496,8 @@ def stage_validate(data_dir, max_bad_share=0.01):
     share = bad_days / max(1, len(days))
     print(f"validate: {len(days)} minute files, {bad_days} with problems ({share:.1%}); daily problems: "
           f"{sum(1 for p in probs if p[0] == 'daily')}; calendar warnings: "
-          f"{sum(1 for p in probs if p[0] == 'calendar')} -> data/validation.csv")
+          f"{sum(1 for p in probs if p[0] == 'calendar')}; identity warnings (ticker reuse?): "
+          f"{sum(1 for p in probs if p[0] == 'identity')} -> data/validation.csv")
     if share > max_bad_share or any(p[0] == "daily" for p in probs):
         sys.exit("DATA GATE FAILED: fix the problems in data/validation.csv before backtesting")
     print("DATA GATE PASSED")

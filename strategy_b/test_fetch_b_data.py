@@ -204,3 +204,40 @@ def test_daily_includes_the_end_day_itself(market, tmp_path):
     F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-02-21"], client=c)
     d = pd.read_csv(tmp_path / "daily.csv")
     assert d["date"].max() == "2019-02-21" and d["date"].min() == "2019-01-02"
+
+
+# ------------------------------------------------------------------ identity breaks (ticker reuse), task u
+def _d(rows):
+    return pd.DataFrame([dict(ticker=t, date=d, open=o, high=max(o, c), low=min(o, c), close=c, volume=1,
+                              split_factor=sf) for t, d, o, c, sf in rows])
+
+
+def test_identity_breaks_known_answers():
+    rows = [("OLD", "2019-03-01", 100, 101, 1.0),          # company A ...
+            ("OLD", "2019-06-03", 8.0, 8.1, 1.0),          # ... same symbol, new company 3 months later -> jump + gap
+            ("SPL", "2019-03-01", 400, 400, 1.0), ("SPL", "2019-03-04", 101, 100, 4.0),   # 4:1 split, factor -> ok
+            ("BAD", "2019-03-01", 400, 400, 1.0), ("BAD", "2019-03-04", 101, 100, 1.0),   # split missing -> jump
+            ("BIO", "2019-03-01", 10, 10, 1.0), ("BIO", "2019-03-04", 25, 24, 1.0),       # 2.5x news gap -> ok
+            ("REL", "2019-03-01", 20, 20, 1.0), ("REL", "2019-05-01", 31, 31, 1.0),       # 61 days, +55% -> gap
+            ("QUI", "2019-03-01", 20, 20, 1.0), ("QUI", "2019-05-01", 22, 22, 1.0)]       # 61 days, +10% -> ok
+    ib = F.identity_breaks(_d(rows))
+    got = {(r.ticker, r.kind) for r in ib.itertuples()}
+    assert got == {("OLD", "jump"), ("BAD", "jump"), ("REL", "gap")}
+    assert ib.set_index("ticker").loc["OLD", "days_since_prev_bar"] == 94
+
+
+def test_validate_writes_identity_warnings_and_does_not_gate(downloaded, tmp_path):
+    import shutil
+    data, _, _ = downloaded
+    F.main(["validate", "--data", data])
+    assert len(pd.read_csv(os.path.join(data, "identity_warnings.csv"))) == 0        # clean synthetic market
+    bad = tmp_path / "reuse"
+    shutil.copytree(data, bad)
+    d = pd.read_csv(bad / "daily.csv")
+    t = d["ticker"].iloc[0]
+    later = d["ticker"].eq(t) & (d["date"] > d.loc[d["ticker"].eq(t), "date"].iloc[20])
+    d.loc[later, ["open", "high", "low", "close"]] *= 5                               # a different company
+    d.to_csv(bad / "daily.csv", index=False)
+    F.main(["validate", "--data", str(bad)])                                          # WARN only: still passes
+    rep = pd.read_csv(bad / "validation.csv")
+    assert (rep["file"] == "identity").sum() == 1 and t in rep.loc[rep["file"] == "identity", "problem"].iloc[0]
