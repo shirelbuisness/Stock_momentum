@@ -759,9 +759,12 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int, scratch_r: floa
     top = max(1, int(math.ceil(0.05 * len(r))))
     out["top5pct_share_of_wins"] = float(pos[:top].sum() / pos.sum()) if pos.sum() > 0 else np.nan
     # pass gate item 6: still positive with the 5 tickers that earned the most net R removed
-    top5 = f.groupby("ticker")["r_net"].sum().nlargest(5).index
-    rest = f[~f["ticker"].isin(top5)]["r_net"]
-    out["mean_R_net_ex_top5_tickers"] = float(rest.mean()) if len(rest) else np.nan
+    if "ticker" in f:
+        top5 = f.groupby("ticker")["r_net"].sum().nlargest(5).index
+        rest = f[~f["ticker"].isin(top5)]["r_net"]
+        out["mean_R_net_ex_top5_tickers"] = float(rest.mean()) if len(rest) else np.nan
+    else:
+        out["mean_R_net_ex_top5_tickers"] = np.nan          # no ticker column -> unknown (fails the gate closed)
     out["exit_mix"] = f["reason"].value_counts(normalize=True).round(3).to_dict()
     return out
 
