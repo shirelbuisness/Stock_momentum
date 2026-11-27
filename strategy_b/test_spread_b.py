@@ -52,8 +52,14 @@ def test_quotes_stage_end_to_end(run, tmp_path):
     f = tr[tr["filled"]].drop_duplicates(["day", "ticker", "entry_t", "exit_t"])
     legs = set(zip(f["day"], f["ticker"], f["entry_t"])) | set(zip(f["day"], f["ticker"], f["exit_t"]))
     assert set(zip(q["day"], q["ticker"], q["minute"])) == legs
-    # 10 s window = quotes at :00 :02 :04 :06 :08; the one at :08 is locked -> 4 kept; spread exactly 20 bp
+    # 10 s window = quotes at :00 :02 :04 :06 :08 (start) or :50 ... :58 (end); one locked in each -> 4 kept
     assert (q["n_quotes"] == 4).all()
+    closes = f[f["reason"] == "close"]
+    assert len(closes) and set(q.merge(closes[["day", "ticker", "exit_t"]].rename(columns={"exit_t": "minute"}))
+                               ["window"]) == {"end"}
+    assert set(q.loc[q["leg"] == "entry", "window"]) == {"start"}
+    ends = [x for _, x in fake.requests if x["start"][17:19] == "50"]
+    assert len(ends) and all(x["end"][14:19] == f"{int(x['start'][14:16]) + 1:02d}:00" for x in ends)
     assert np.allclose(q["spread_bp_median"], 20.0, atol=1e-3)
     assert {p for p, _ in fake.requests} == {"/v2/stocks/quotes"}
     assert all(x["feed"] == "sip" for _, x in fake.requests)
@@ -61,12 +67,15 @@ def test_quotes_stage_end_to_end(run, tmp_path):
     F.main(["quotes", "--data", data, "--trades", os.path.join(out, "trades.csv")], client=_client(fake))
     assert len(fake.requests) == n0
     assert len(pd.read_csv(os.path.join(data, "quotes_spread.csv"))) == len(q)
-    # a 20 s window reaches the one-sided quote at :14 and the locked ones at :08 and :18 -> 7 kept
+    # a 20 s window at the start reaches the one-sided quote at :14 and the locked ones at :08 and :18 -> 7 kept;
+    # at the end (:40-:58) only the locked :48 and :58 go -> 8 kept
     data2 = str(tmp_path / "data2")
     F.main(["quotes", "--data", data2, "--trades", os.path.join(out, "trades.csv"), "--window-s", "20",
             "--sample", "5"], client=_client(fake))
     q2 = pd.read_csv(os.path.join(data2, "quotes_spread.csv"))
-    assert (q2["n_quotes"] == 7).all() and len(q2) <= 10
+    assert len(q2) <= 10
+    assert (q2.loc[q2["window"] == "start", "n_quotes"] == 7).all()
+    assert (q2.loc[q2["window"] == "end", "n_quotes"] == 8).all()
 
 
 def test_quotes_holdout_guard(tmp_path):

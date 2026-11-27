@@ -16,16 +16,17 @@ What it does for --day D:
      same way the backtest applies it.
      --selection-feed iex = what a FREE-plan live instance sees at 09:35 (SIP is 15 minutes delayed). IEX volume
      is a small slice of the market, so the RVOL baseline is then built from IEX opening bars too (cached in
-     <data>/minutes_iex_opening/); mixing IEX today with a SIP baseline would put every RVOL near 0.03 and the
+     <data>/minutes_iex_opening_<N>m/); mixing IEX today with a SIP baseline would put every RVOL near 0.03 and the
      RVOL >= 100% filter would reject almost everything.
   2. After the close: D's full-day SIP 1-min bars for the selected names (+ SPY), then b_mvb.run_many - the
      backtest's own pessimistic fill model and full cost model - on exactly those candidates.
   3. Appends (re-running a day replaces that day's rows for that variant; atomic writes):
-       <out>/paper_trades.csv   day, ticker, side, variant_id, r_net, r_gross, entry_t, exit_t, entry_px, exit_px,
+       <out>/paper_trades.csv   day, ticker, side, variant_id, r_net, r_gross, entry_t, exit_t, entry_px, exit_px, r_ps, atr14,
                                 reason, feed_selection, code_sha, kind=shadow   (filled trades only)
        <out>/live_selection.csv day, ticker, side, variant_id, feed_selection  (every signalled name)
        <out>/model_refs.csv     day, ticker, variant_id, leg (entry/exit), side (+1 buy/-1 sell), ref_px, qty_1x:
-                                the model's reference prices BEFORE costs. When a paper order path exists, its real
+                                the model's reference prices BEFORE costs (trades.csv prices include half spread +
+                                k; they are taken back out here, so paper_gate_b compares like with like). When a paper order path exists, its real
                                 fill prices join here into paper_fills.csv (side, ref_px, fill_px, qty).
 paper_fills.csv itself is NOT written: real fills need real (paper) orders, which this tool never places.
 
@@ -46,7 +47,7 @@ import b_mvb as B
 import dry_run_b as D
 import fetch_b_data as F
 
-TRADE_OUT = ["day", "ticker", "side", "variant_id", "r_net", "r_gross", "entry_t", "exit_t", "entry_px", "exit_px",
+TRADE_OUT = ["day", "ticker", "side", "variant_id", "r_net", "r_gross", "entry_t", "exit_t", "entry_px", "exit_px", "r_ps", "atr14",
              "reason", "same_bar_stop", "feed_selection", "code_sha", "kind"]
 SEL_OUT = ["day", "ticker", "side", "variant_id", "feed_selection"]
 REF_OUT = ["day", "ticker", "variant_id", "leg", "side", "ref_px", "qty_1x"]
@@ -71,7 +72,7 @@ def fetch_opening(client, day: str, syms: list[str], k: B.Knobs, feed: str) -> p
 
 def iex_baseline_dir(client, data_dir: str, day: str, syms: list[str], k: B.Knobs) -> str:
     """IEX opening bars for the RVOL window before `day`, cached per session; missing names are fetched once."""
-    cdir = os.path.join(data_dir, "minutes_iex_opening")
+    cdir = os.path.join(data_dir, f"minutes_iex_opening_{opening_end(k)}m")   # per window: F9 needs 30 minutes
     os.makedirs(cdir, exist_ok=True)
     days = [d for d in F.trading_days(data_dir) if d < day][-(k.hist_days + 5):]
     for d in days:
@@ -138,6 +139,14 @@ def shadow_trades(client, data_dir: str, day: str, var: B.Variant, feed: str):
     return tr, cand
 
 
+def model_side_cost(trigger: float, k: B.Knobs) -> float:
+    """Half spread + slippage k per share per side, exactly as b_mvb.simulate_trade computes it (at the trigger).
+    trades.csv's entry_px / exit_px INCLUDE this cost; the reference price a real fill is compared with must not."""
+    ref = abs(trigger)
+    hs = max(0.5 * B.TICK, ref * k.half_spread_bp / 1e4) if k.half_spread_bp > 0 else 0.0
+    return hs + max(k.slip_ticks * B.TICK, ref * k.slip_bp / 1e4)
+
+
 def _replace_rows(path: str, new: pd.DataFrame, day: str, variant_id: str, cols: list[str]):
     old = pd.read_csv(path, dtype={"ticker": str}) if os.path.exists(path) else pd.DataFrame(columns=cols)
     if len(old):
@@ -158,11 +167,14 @@ def write_outputs(out: str, day: str, var: B.Variant, tr: pd.DataFrame, cand: pd
         if len(cand) else pd.DataFrame(columns=SEL_OUT)
     _replace_rows(os.path.join(out, "live_selection.csv"), sel, day, var.id, SEL_OUT)
     refs = []
+    trig = {r["ticker"]: B.entry_trigger(r, int(r["side"]), var.knobs) for _, r in cand.iterrows()}
     for _, r in f.iterrows():
-        q = int(np.floor(equity / var.knobs.top_n / r["entry_px"])) if r["entry_px"] > 0 else 0
         s = int(r["side"])
-        refs += [dict(day=day, ticker=r["ticker"], variant_id=var.id, leg="entry", side=s, ref_px=r["entry_px"], qty_1x=q),
-                 dict(day=day, ticker=r["ticker"], variant_id=var.id, leg="exit", side=-s, ref_px=r["exit_px"], qty_1x=q)]
+        c_ps = model_side_cost(trig[r["ticker"]], var.knobs)
+        raw_in, raw_out = r["entry_px"] - s * c_ps, r["exit_px"] + s * c_ps     # undo half spread + k
+        q = int(np.floor(equity / var.knobs.top_n / raw_in)) if raw_in > 0 else 0
+        refs += [dict(day=day, ticker=r["ticker"], variant_id=var.id, leg="entry", side=s, ref_px=raw_in, qty_1x=q),
+                 dict(day=day, ticker=r["ticker"], variant_id=var.id, leg="exit", side=-s, ref_px=raw_out, qty_1x=q)]
     _replace_rows(os.path.join(out, "model_refs.csv"), pd.DataFrame(refs, columns=REF_OUT), day, var.id, REF_OUT)
 
 

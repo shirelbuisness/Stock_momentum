@@ -66,6 +66,14 @@ python b_mvb.py ... same as step 3 ... --ticks data/ticks.csv
 - The report column "of which resolved by ticks %" should be close to 100%. Whatever is not resolved stays pessimistic.
 - **Decide between base and the stop variants only on the tick-resolved run.**
 
+## 4b. Measure the spread the model trades at (cost calibration, diagnostic)
+```
+python fetch_b_data.py quotes --trades runs/<DEV-A run>/trades.csv --sample 3000   # NBBO, ~1 call per (day, minute)
+python spread_b.py --run runs/<DEV-A run> --quotes data/quotes_spread.csv           # -> spread_calibration.md
+```
+- Measured half spread (bp) at the entry/exit moments vs the model's 3 bp, and each version's mean net R re-costed.
+- Changes nothing by itself: which statistic becomes "the measured value" is a team decision in the prereg; the rerun is a new trial.
+
 ## 5. Shortlist, confirm, pass gate (mechanical)
 ```
 python gate_b.py shortlist --dev-a runs/<DEV-A tick-resolved run>
@@ -81,6 +89,7 @@ Stop versions are only shortlisted from a `--ticks` run (R9); SPA p > 0.10 empti
 - `python to_parquet.py --src data --dst data_parquet` → then `--daily data_parquet/daily.parquet --minutes data_parquet/minutes` (identical results, smaller files; needs pyarrow).
 - `python dry_run_b.py --data data --day 2019-02-22` → the 09:35 order intents for a DEV day, written to a file (no broker code).
 - `python paper_vs_cone.py --run runs/<run> --paper paper_trades.csv` → paper shadow fills vs the day-block cone.
+- `python shadow_day_b.py --data data --day <D> [--to <D2>] [--selection-feed iex|sip]` → the paper SHADOW logger (no orders): selection as live makes it, simulated on the day's SIP bars with the backtest's model → `paper/paper_trades.csv`, `live_selection.csv`, `model_refs.csv` for `paper_gate_b.py` / `paper_vs_cone.py`. Run after ~16:20 ET. `iex` (the free plan's live view) builds the RVOL baseline from IEX opening bars too.
 
 ## Design decisions in the downloader (and why)
 - **One symbol mapping everywhere (Alpaca default = today's ticker).** Mixing in per-day `asof` labels the same company differently across files (a boss-review finding; a test guards it).

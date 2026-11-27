@@ -10,7 +10,8 @@ Stages (each is resumable; finished pieces are skipped on rerun):
   fullday   Stage 2: full-session 1-min bars for the top-100 RVOL names + 30 seeded random eligible names + SPY.
   ticks     For trades whose entry and stop fall in the same minute (from a b_mvb run's trades.csv), download the
             tick prints of that minute so the backtest can see which came first (build log finding R9).
-  quotes    SIP NBBO quotes in the first --window-s seconds of every entry and exit minute of a run's trades
+  quotes    SIP NBBO quotes in --window-s seconds of every entry and exit minute of a run's trades (the first
+            seconds for entries and stops, the last ones for the 15:58 close exit)
             (seeded sample with --sample) -> data/quotes_spread.csv: the measured spread at the moment the
             model trades, for the cost calibration (spread_b.py). The cost model's 3 bp half spread is an
             assumption until this is measured.
@@ -427,7 +428,7 @@ def stage_ticks(client, data_dir, trades_csv, only_same_bar=True):
     print(f"ticks: {len(need)} ambiguous trades, {len(new)} prints stored -> {out_path}")
 
 
-QUOTE_COLS = ["day", "ticker", "minute", "leg", "n_quotes", "spread_bp_median", "spread_usd_median", "mid_median"]
+QUOTE_COLS = ["day", "ticker", "minute", "leg", "window", "n_quotes", "spread_bp_median", "spread_usd_median", "mid_median"]
 
 
 def quote_spreads(quotes: list[dict]) -> dict | None:
@@ -453,22 +454,28 @@ def stage_quotes(client, data_dir, trades_csv, window_s=10, sample=None, seed=7,
         sys.exit("HOLDOUT GUARD: the trades file has 2024+ days.")
     if sample and len(tr) > sample:
         tr = tr.sample(n=sample, random_state=seed)
-    legs = pd.concat([tr[["day", "ticker"]].assign(minute=tr["entry_t"].astype(int), leg="entry"),
-                      tr[["day", "ticker"]].assign(minute=tr["exit_t"].astype(int), leg="exit")],
+    # where in the minute the model trades: an entry / a stop at the START (a stop order triggers on the way
+    # through; gaps fill at the open), the close exit at the END (it fills at the bar's close)
+    at_close = tr["reason"].astype(str).eq("close").to_numpy() if "reason" in tr else np.zeros(len(tr), bool)
+    legs = pd.concat([tr[["day", "ticker"]].assign(minute=tr["entry_t"].astype(int), leg="entry", window="start"),
+                      tr[["day", "ticker"]].assign(minute=tr["exit_t"].astype(int), leg="exit",
+                                                   window=np.where(at_close, "end", "start"))],
                      ignore_index=True).drop_duplicates(["day", "ticker", "minute"])
     out_path = os.path.join(data_dir, "quotes_spread.csv")
     old = pd.read_csv(out_path, dtype={"ticker": str}) if os.path.exists(out_path) else pd.DataFrame(columns=QUOTE_COLS)
     have = set(zip(old["day"], old["ticker"], old["minute"].astype(int)))
     rows = []
-    for (day, minute), grp in legs.groupby(["day", "minute"]):
+    for (day, minute, where), grp in legs.groupby(["day", "minute", "window"]):
         syms = sorted(s for s in grp["ticker"] if (day, s, int(minute)) not in have)
         if not syms:
             continue
         leg_of = dict(zip(grp["ticker"], grp["leg"]))
         hhmm = f"{int(minute) // 60:02d}:{int(minute) % 60:02d}"
-        start = ny_to_utc(day, hhmm)
-        end = (datetime.fromisoformat(start.replace("Z", "+00:00")) + timedelta(seconds=window_s)) \
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        t0 = datetime.fromisoformat(ny_to_utc(day, hhmm).replace("Z", "+00:00"))
+        if where == "end":
+            t0 += timedelta(seconds=60 - window_s)
+        start = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = (t0 + timedelta(seconds=window_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
         got: dict[str, list] = {}
         for page in client.paged(DATA_URL, "/v2/stocks/quotes",
                                  dict(symbols=",".join(syms), start=start, end=end, limit=10000, feed="sip",
@@ -477,7 +484,7 @@ def stage_quotes(client, data_dir, trades_csv, window_s=10, sample=None, seed=7,
                 got.setdefault(sym, []).extend(qs)
         for sym in syms:
             st = quote_spreads(got.get(sym, []))
-            rows.append(dict(day=day, ticker=sym, minute=int(minute), leg=leg_of[sym],
+            rows.append(dict(day=day, ticker=sym, minute=int(minute), leg=leg_of[sym], window=where,
                              **(st or dict(n_quotes=0, spread_bp_median=np.nan, spread_usd_median=np.nan,
                                            mid_median=np.nan))))
     new = pd.DataFrame(rows, columns=QUOTE_COLS)

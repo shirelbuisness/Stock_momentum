@@ -128,7 +128,7 @@ def test_iex_selection_uses_an_iex_baseline(setup, tmp_path):
         list(s2[["day", "ticker", "side"]].itertuples(index=False))
     t1, t2 = (pd.read_csv(os.path.join(x, "paper_trades.csv")) for x in (sip, iex))
     assert np.allclose(t1["r_net"], t2["r_net"])        # simulated on SIP bars either way
-    assert os.path.isdir(os.path.join(data, "minutes_iex_opening"))
+    assert os.path.isdir(os.path.join(data, "minutes_iex_opening_10m"))
     n0 = len(fake.requests)
     _shadow(setup, tmp_path / "iex2", "B-v1__base", feed="iex", fake=fake)
     hist_iex = [q for p, q in fake.requests[n0:] if p == "/v2/stocks/bars" and q.get("feed") == "iex"
@@ -164,6 +164,18 @@ def test_rerun_replaces_the_day_and_formats_feed_the_paper_gate(setup, tmp_path)
     refs = pd.read_csv(os.path.join(out, "model_refs.csv"))
     assert len(refs) == 2 * len(after) and set(refs["leg"]) == {"entry", "exit"}
     assert (refs.groupby(["day", "ticker"])["side"].sum() == 0).all()
+    # reference prices are BEFORE costs: ref + side x (half spread + k at the trigger) = the trade's executed price
+    m = refs.merge(after[["day", "ticker", "entry_px", "exit_px"]], on=["day", "ticker"])
+    ent = m[m["leg"] == "entry"].set_index(["day", "ticker"])["ref_px"]
+    k = B.Knobs()
+    for _, r in m.iterrows():
+        c = S.model_side_cost(ent[(r["day"], r["ticker"])], k)     # the cost is set at the trigger ~ the entry ref
+        px = r["entry_px"] if r["leg"] == "entry" else r["exit_px"]
+        assert abs(r["ref_px"] + r["side"] * c - px) < 2e-3
+        assert abs(r["ref_px"] - px) >= 0.015 - 1e-9                # never 0: at least half a tick + 1 tick
+    # exact: a long entry at a $50.00 trigger costs max(0.005, 50 x 3 bp) + max(0.01, 50 x 0 bp) = 0.015 + 0.01
+    assert S.model_side_cost(50.0, k) == pytest.approx(0.025)
+    assert S.model_side_cost(10.0, k) == pytest.approx(0.015)
     # the paper gate reads the files (the backtest = the logger's own trades -> overlap 100%, mean inside the CI)
     sel = pd.read_csv(os.path.join(out, "live_selection.csv"), dtype={"ticker": str})
     bt = after.assign(filled=True)

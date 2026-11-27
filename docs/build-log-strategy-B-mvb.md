@@ -1,5 +1,12 @@
 # Build log: Strategy B backtester (`strategy_b/b_mvb.py`) and downloader (`strategy_b/fetch_b_data.py`)
 
+## Round 6: night session 3 (27.11.2026, late). Details: `night-log-2026-11-27.md`
+- `shadow_day_b.py`: paper shadow logger without orders; shadow trades = backtest trades (7 versions, exact), verifier 283/283 on a 74-session shadow run.
+- **Finding (IEX):** the free plan's 09:35 view is IEX. IEX volume ÷ a SIP baseline → RVOL ≈ IEX share → the RVOL ≥ 100% filter selects nothing. Fixed in the logger (IEX baseline); a live engine needs the same. Day-to-day IEX-share noise (σ 0.5, synthetic) gave 79% overlap, under the paper→live gate's 80%.
+- `fetch_b_data.py quotes` + `spread_b.py`: half-spread calibration from SIP NBBO at the model's trade moments (close exits measured at the END of the 15:58 bar).
+- **Boss findings fixed:** `model_refs.csv` first used trades.csv prices, which already include half spread + k → the paper slippage check would have been lenient by the whole model cost; the IEX baseline cache was shared across OR lengths (F9 would have read 10-minute bars as its 15-minute baseline).
+- **156 tests** (155 + Parquet). Still never run on real data.
+
 ## Round 5: night session 2 (27.11.2026, evening). Details: `night-log-2026-11-27.md`
 - Market exposure of the base vs SPY + F8 red-signal-day diagnostic (plan v3 §5); B0-replication sanity gate (`--replication`); mean net R without the top-5 tickers.
 - `gate_b.py holdout`: the whole pass gate, with the open prereg choices as required arguments; `--nulls-all-versions` for item 3.
@@ -88,3 +95,4 @@
 - ~~Gate tools not built~~ → built in Round 4 (DSR, random-skip, SPA, PBO). Still open: 1,000 random-entry/names nulls is just `--nulls 1000` (slow, not timed on real data).
 - **The prereg must specify the Sharpe sizing.** Proposal: equal notional 1/N, as implemented.
 - **The cost model uses IBKR commission while paper runs on Alpaca (commission-free).** That is pessimistic, so keep it, but say so.
+- **Live ranking feed:** on the free plan the 09:35 ranking is IEX-only. Measure IEX-vs-SIP top-N overlap on real data (`shadow_day_b.py --selection-feed iex` vs `sip` over DEV days) before paper; if < 80%, a SIP real-time plan or a different ranking input is needed (team decision).

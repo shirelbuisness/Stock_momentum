@@ -43,4 +43,10 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] z2) `shadow_day_b.py`: paper shadow logger WITHOUT orders: 09:35 selection (as the dry run) + after the close the day's SIP bars → the backtest's own fill model → appends `paper_trades.csv` + `live_selection.csv` (formats of paper_gate_b / paper_vs_cone); parity test vs the backtest; selection feed iex|sip (live free plan ranks on IEX)
 - [x] aa) Spread calibration from SIP quotes (cost model: "3 bp until calibrated"): `fetch_b_data.py quotes --trades <run>/trades.csv` (NBBO in a window around each entry and exit minute, market data only) + `spread_b.py` → measured half spread in bp (median / by price bucket) with tests; applying it stays a team decision
 - [x] ab) Rehearsal: shadow logger over many synthetic DEV days → `paper_gate_b.py` end to end (overlap and expectancy checks pass on honest data, fail on a planted bug)
-- [ ] ac) Boss review #6 + docs refresh (CLAUDE.md, runbook, build log Round 6)
+- [x] ac) Boss review #6 + docs refresh (CLAUDE.md, runbook, build log Round 6)
+
+## Next (for the next session)
+- [ ] z1) With keys: `python run_dev_a.py` → read the draft `docs/results-DEV-A.md` with Shirel; then `fetch_b_data.py quotes` + `spread_b.py` on the DEV-A run
+- [ ] z3) Measure real-data runtime of DEV-A and of `--nulls-all-versions`
+- [ ] ad) With keys: IEX vs SIP top-N overlap on ~60 DEV days (`shadow_day_b.py --selection-feed iex` vs `sip`, `paper_gate_b.selection_overlap`) → decides whether the free plan can rank live (Decision 12)
+- [ ] ae) Paper order path design doc (no code until the team signs): risk.approve contract for B, bracket per name, client_order_id, reconciliation — per the order-risk skill; the shadow logger's model_refs.csv is the join key for real fills
