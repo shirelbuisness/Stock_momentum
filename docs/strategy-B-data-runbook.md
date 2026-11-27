@@ -1,12 +1,12 @@
 # Strategy B: data runbook (Alpaca free plan, SIP) → first real number
-Code: `strategy_b/fetch_b_data.py` (downloader), `strategy_b/b_mvb.py` (backtester). Tests: all `strategy_b/test_*.py`, **112 pass** against an in-process fake Alpaca (`strategy_b/fake_alpaca.py`). It has never been run against the real API; step 1 below is that check. Run every command from inside `strategy_b/`.
+Code: `strategy_b/fetch_b_data.py` (downloader), `strategy_b/b_mvb.py` (backtester). Tests: all `strategy_b/test_*.py`, **136 pass** against an in-process fake Alpaca (`strategy_b/fake_alpaca.py`). It has never been run against the real API; step 1 below is that check. Run every command from inside `strategy_b/`.
 
 ## 0. Setup (once)
 ```
 pip install -r requirements.txt      # from the repo root
 export APCA_API_KEY_ID=...      # free Alpaca account (paper is fine)
 export APCA_API_SECRET_KEY=...
-python -m pytest -q             # must print "112 passed" before touching the real API
+python -m pytest -q             # must print "136 passed" (or 135 + 1 skipped without pyarrow) before touching the real API
 ```
 (Windows PowerShell: `$env:APCA_API_KEY_ID="..."` instead of `export`.)
 

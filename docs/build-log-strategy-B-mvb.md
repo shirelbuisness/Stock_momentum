@@ -1,5 +1,13 @@
 # Build log: Strategy B backtester (`strategy_b/b_mvb.py`) and downloader (`strategy_b/fetch_b_data.py`)
 
+## Round 5: night session 2 (27.11.2026, evening). Details: `night-log-2026-11-27.md`
+- Market exposure of the base vs SPY + F8 red-signal-day diagnostic (plan v3 §5); B0-replication sanity gate (`--replication`); mean net R without the top-5 tickers.
+- `gate_b.py holdout`: the whole pass gate, with the open prereg choices as required arguments; `--nulls-all-versions` for item 3.
+- `run_dev_a.py` (runbook as one command, draft results doc); `validate` lists likely ticker reuse; `paper_gate_b.py` (paper → live gate).
+- SPA size measured at DEV-A length: ~6% at 5%, ~11% at 10% (slightly liberal).
+- **Boss findings fixed:** `SPY_PREV` leaked between runs in one process; a new summary column broke a test (CI red for 4 runs, fixed; full suite now runs before every push).
+- **136 tests** (135 + Parquet). Still never run on real data.
+
 ## Round 4: unattended night session (27.11.2026). Details: `night-log-2026-11-27.md`
 - Gate tools built: DSR, random-skip null, Hansen SPA, PBO (CSCV), expected cone (iid + day-block), `gate_b.py`.
 - NYSE calendar 2015–2023 is now the default; breakeven in bp; scratches; short shadow (SSR/ETB); 09:35 dry run (no broker code); Parquet option; CI on every push.
