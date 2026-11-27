@@ -13,7 +13,7 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] i) Optional Parquet storage with an identical-results test
 - [x] j) SKIPPED (no keys; host blocked) — If Alpaca keys exist and data.alpaca.markets is reachable: runbook through DEV-A + ticks → docs/results-DEV-A.md; otherwise log skipped
 
-## Refill 16:52 (blocks: first real number / DEV-B gate / safe paper)
+## Refill 15:01 UTC (blocks: first real number / DEV-B gate / safe paper)
 - [x] k) Docs refresh: runbook, plan §6–7, CLAUDE.md, build log → tonight's features and test counts (the runbook still says "42 passed")
 - [x] l) `gate_b.py`: DEV-A shortlist + DEV-B confirmation exactly per the prereg protocol (Holm < 0.10 & positive; t ≥ 2, same sign & ≥ ½ size, DSR ≥ 0.95, positive at 2k), with tests
 - [x] m) Day-block bootstrap option for the expected cone (trades on one day are correlated), iid vs block on synth
