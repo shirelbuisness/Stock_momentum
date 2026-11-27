@@ -116,7 +116,7 @@ OPEN_MIN = hm("09:30")
 
 
 def load_daily(path: str) -> pd.DataFrame:
-    return load_daily_df(pd.read_csv(path, dtype={"ticker": str}))
+    return load_daily_df(read_table(path, dtype={"ticker": str}))
 
 
 def load_daily_df(d: pd.DataFrame) -> pd.DataFrame:
@@ -160,15 +160,27 @@ def daily_features(d: pd.DataFrame, hist: int) -> pd.DataFrame:
 
 
 def minute_files(dirpath: str) -> dict[str, str]:
-    out = {}
-    for p in glob.glob(os.path.join(dirpath, "minutes_*.csv")):
-        day = os.path.basename(p)[len("minutes_"):-4]
-        out[day] = p
+    """day -> minute file. CSV (the downloader's output) or Parquet (to_parquet.py copies). A directory must hold
+    ONE format: mixing them would make the data fingerprint and the day set ambiguous."""
+    out, kinds = {}, set()
+    for ext in (".csv", ".parquet"):
+        for p in glob.glob(os.path.join(dirpath, f"minutes_*{ext}")):
+            out[os.path.basename(p)[len("minutes_"):-len(ext)]] = p
+            kinds.add(ext)
+    if len(kinds) > 1:
+        sys.exit(f"{dirpath} holds both CSV and Parquet minute files: point --minutes at one format")
     return dict(sorted(out.items()))
 
 
+def read_table(path: str, dtype: dict | None = None) -> pd.DataFrame:
+    """CSV or Parquet by extension (Parquet needs pyarrow; it is optional)."""
+    if path.endswith(".parquet"):
+        return pd.read_parquet(path)
+    return pd.read_csv(path, dtype=dtype)
+
+
 def load_minutes(path: str) -> pd.DataFrame:
-    m = pd.read_csv(path, dtype={"ticker": str, "time": str})
+    m = read_table(path, dtype={"ticker": str, "time": str})
     m["tmin"] = m["time"].map(hm)                 # hm() is lru-cached: ~400 distinct values per file
     return m.sort_values(["ticker", "tmin"]).reset_index(drop=True)
 
