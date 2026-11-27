@@ -1074,6 +1074,9 @@ def _main(argv=None):
         json.dump(dict(run=stamp, data_fingerprint=fp, start=a.start, end=a.end, versions=cones), f, indent=2)
     gate["cone_base"] = cones[variants[0].id]
     gate["shadow"] = shadow
+    with open(os.path.join(outdir, "gate.json"), "w") as f:          # run-level gate numbers for gate_b.py
+        json.dump({k_: gate.get(k_) for k_ in ("n_trials", "var_sr", "sr0_day", "spa_p", "spa_best", "pbo",
+                                                "pbo_splits", "pbo_blocks")}, f, indent=2, default=float)
     write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
