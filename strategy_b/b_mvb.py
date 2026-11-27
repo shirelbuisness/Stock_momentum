@@ -703,6 +703,7 @@ def daily_ret_1x(tr: pd.DataFrame | None, all_days: list[str], top_n: int) -> pd
     return (f.groupby("day")["ret_net"].sum() / top_n).reindex(all_days, fill_value=0.0)
 
 
+REPLICATION_SHARPE_MIN = 2.0   # prereg rev 3 "Sanity gate on B0-replication over DEV"
 SCRATCH_R = 0.05   # |net R| <= this = a scratch (neither win nor loss); proposal, team to confirm
 
 
@@ -757,6 +758,10 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int, scratch_r: floa
     pos = np.sort(r[r > 0].to_numpy())[::-1]
     top = max(1, int(math.ceil(0.05 * len(r))))
     out["top5pct_share_of_wins"] = float(pos[:top].sum() / pos.sum()) if pos.sum() > 0 else np.nan
+    # pass gate item 6: still positive with the 5 tickers that earned the most net R removed
+    top5 = f.groupby("ticker")["r_net"].sum().nlargest(5).index
+    rest = f[~f["ticker"].isin(top5)]["r_net"]
+    out["mean_R_net_ex_top5_tickers"] = float(rest.mean()) if len(rest) else np.nan
     out["exit_mix"] = f["reason"].value_counts(normalize=True).round(3).to_dict()
     return out
 
@@ -912,6 +917,9 @@ def _main(argv=None):
     ap.add_argument("--securities", default=None, help="securities.csv from fetch_b_data.py assets: TODAY's "
                                                        "easy_to_borrow flags label the short shadow")
     ap.add_argument("--no-short-shadow", action="store_true", help="skip the backtest-only short shadow of the base")
+    ap.add_argument("--replication", action="store_true",
+                    help="also run B0-replication (base rules, long + short, commission only) for the prereg sanity "
+                         "gate: gross Sharpe >= 2.0 over DEV, else suspect data or code. A code check, never a verdict")
     ap.add_argument("--borrow-bp-yr", type=float, default=30.0, help="borrow stress for the short shadow, bp/year")
     ap.add_argument("--scratch-r", type=float, default=SCRATCH_R, help="|net R| <= this counts as a scratch")
     ap.add_argument("--gate-reps", type=int, default=1000, help="bootstrap / random-skip repetitions (DSR/SPA/PBO)")
@@ -1009,6 +1017,12 @@ def _main(argv=None):
     if not a.no_short_shadow and variants[0].knobs.sides == "long":
         add(("shadow_short",), (Variant(shadow_id, replace(variants[0].knobs, sides="short"),
                                         "backtest-only short shadow of the base (never a verdict)"), "", 0))
+    repl_id = variants[0].id + "__replication"
+    if a.replication:
+        add(("replication",), (Variant(repl_id, replace(variants[0].knobs, sides="both", half_spread_bp=0.0,
+                                                        slip_ticks=0.0, slip_bp=0.0),
+                                       "B0-replication: long+short, commission only (code check, never a verdict)"),
+                               "", 0))
     for mode in (["random_entry", "random_names"] if a.nulls > 0 else []):
         for rep in range(a.nulls):
             add(("null", mode, rep), (variants[0], mode, a.seed + 1000 * rep))
@@ -1051,8 +1065,16 @@ def _main(argv=None):
         shadow = short_shadow_summary(sh_tr, all_days, variants[0].knobs.top_n, a)
         shadow["id"] = shadow_id
         all_tr.append(sh_tr.assign(variant=shadow_id))
-    gate = gate_statistics(variants, results, idx, rows, all_days, a,
-                           extra_trials=[shadow.get("sharpe_1x", "")] if shadow else [])
+    repl = None
+    if ("replication",) in idx:
+        rp_tr = results[idx[("replication",)]]
+        repl = summarize(rp_tr, all_days, variants[0].knobs.top_n, a.scratch_r)
+        repl.update(id=repl_id, note="B0-replication sanity (code check)")
+        repl["pass"] = bool(np.isfinite(repl.get("sharpe_1x", np.nan)) and repl["sharpe_1x"] >= REPLICATION_SHARPE_MIN)
+        all_tr.append(rp_tr.assign(variant=repl_id))
+    extra = ([shadow.get("sharpe_1x", "")] if shadow else []) + ([repl.get("sharpe_1x", "")] if repl else [])
+    gate = gate_statistics(variants, results, idx, rows, all_days, a, extra_trials=extra)
+    gate["replication"] = repl
 
     null_rows = []
     if a.nulls > 0:
@@ -1095,14 +1117,16 @@ def _main(argv=None):
     gate["shadow"] = shadow
     with open(os.path.join(outdir, "gate.json"), "w") as f:          # run-level gate numbers for gate_b.py
         json.dump({k_: gate.get(k_) for k_ in ("n_trials", "var_sr", "sr0_day", "spa_p", "spa_best", "pbo",
-                                                "pbo_splits", "pbo_blocks", "beta")}, f, indent=2, default=float)
+                                                "pbo_splits", "pbo_blocks", "beta")} | {"replication": (
+            {k_: repl.get(k_) for k_ in ("trades", "sharpe_1x", "mean_R_net", "pass")} if repl else None)},
+                  f, indent=2, default=float)
     write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
     with open(a.trial_log, "a") as f:
         if new:
             f.write("run_stamp,variant_id,start,end,trades,mean_R_net,t_net,sharpe_1x,data_fp\n")
-        for s in rows + ([shadow] if shadow else []):     # the shadow is a backtest run too: it counts as a trial
+        for s in rows + ([shadow] if shadow else []) + ([repl] if repl else []):   # every backtest run is a trial
             f.write(f"{stamp},{s['id']},{a.start},{a.end},{s.get('trades', 0)},{s.get('mean_R_net', '')},"
                     f"{s.get('t_net', '')},{s.get('sharpe_1x', '')},{fp}\n")
     print(f"\nreport: {os.path.join(outdir, 'report.md')}")
@@ -1133,6 +1157,7 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
             ("mean_R_net_ohlc_path", "mean R if same-bar = OHLC path"),
             ("quarters_pos", "quarters +"), ("longest_losing_streak", "longest losing streak"),
             ("top5pct_share_of_wins", "top-5% share of wins"),
+            ("mean_R_net_ex_top5_tickers", "mean R w/o top-5 tickers"),
             ("dR_vs_base", "ΔR/trade vs base"), ("t_vs_base", "t vs base"),
             ("dR_per_day_vs_base", "ΔR/day vs base"), ("t_nw_vs_base", "t NW (day)"), ("p_holm", "p Holm"),
             ("dsr", "DSR"), ("rs_p_trades", "random-skip p (trades)"), ("rs_p_days", "random-skip p (days)")]
@@ -1206,6 +1231,14 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
         for h, x in cone["horizons"].items():
             y = iid.get(h, {}).get("cum_R", [np.nan] * 3)
             L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"] + [y[0], y[2]]) + " |")
+    rp = gate.get("replication")
+    if rp:
+        L += ["", "## B0-replication sanity gate (code check, never a verdict)", "",
+              "Base rules, long + short, commission only (no half spread, no slippage); Sharpe on equal notional "
+              "(leverage does not change a Sharpe). Prereg: gross Sharpe ≥ 2.0 over DEV, else suspect data or code.", "",
+              f"Trades {rp.get('trades', 0)}, mean R {fmt(rp.get('mean_R_net'))}, **Sharpe {fmt(rp.get('sharpe_1x'), 2)} → "
+              f"{'PASS' if rp.get('pass') else 'FAIL: check the data and the code before reading anything else'}**. "
+              "Logged as one trial."]
     be = gate.get("beta") or {}
     if be.get("days", 0) >= 3 and "beta" in be:
         L += ["", "## Market exposure of the base (plan v3 §5; diagnostic, not a verdict)", "",

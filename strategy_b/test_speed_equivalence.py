@@ -54,12 +54,28 @@ def _run(mod, tmp_path, tag, extra=("--breakeven",)):
 
 
 POST_FREEZE = ("Expected cone", "Market exposure")   # report sections changed/added after the freeze (tasks m, o)
+POST_FREEZE_COLS = ("mean R w/o top-5 tickers",)   # main-table columns added after the freeze (task p)
 
 
 def _sections(report: str) -> list[str]:
     """The report split at '## ' headings, minus the sections added or changed after the freeze."""
     parts = report.split("\n## ")
-    return [parts[0]] + [p for p in parts[1:] if not p.startswith(POST_FREEZE)]
+    return [_drop_cols(parts[0])] + [p for p in parts[1:] if not p.startswith(POST_FREEZE)]
+
+
+def _drop_cols(text: str) -> str:
+    """Remove the post-freeze columns from the markdown table(s) in `text`."""
+    out, drop = [], set()
+    for line in text.split("\n"):
+        if line.startswith("|"):
+            cells = line.split("|")
+            if any(c.strip() in POST_FREEZE_COLS for c in cells):
+                drop = {i for i, c in enumerate(cells) if c.strip() in POST_FREEZE_COLS}
+            line = "|".join(c for i, c in enumerate(cells) if i not in drop)
+        else:
+            drop = set()
+        out.append(line)
+    return "\n".join(out)
 
 
 def _same(out_a, out_b):
@@ -67,6 +83,7 @@ def _same(out_a, out_b):
     ta = ta[tb.columns]                                   # columns added after the freeze (ssr, etb) are extra
     pd.testing.assert_frame_equal(ta, tb, check_exact=False, rtol=1e-12, atol=1e-12)
     sa, sb = pd.read_csv(f"{out_a}/summary.csv"), pd.read_csv(f"{out_b}/summary.csv")
+    sa = sa[sb.columns]                                   # columns added after the freeze (task p) are extra
     pd.testing.assert_frame_equal(sa, sb, check_exact=False, rtol=1e-12, atol=1e-12)
     ra, rb = open(f"{out_a}/report.md").read(), open(f"{out_b}/report.md").read()
     assert _sections(ra) == _sections(rb) and len(_sections(ra)) >= 5    # most of the report is still compared
