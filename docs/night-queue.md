@@ -24,5 +24,5 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] p) Missing pass-gate numbers in the summary: net R with the top-5 tickers removed; B0-replication sanity (long+short, 4×, commission only, gross Sharpe ≥ 2.0) as a mechanical check
 - [x] q) `gate_b.py holdout`: the prereg pass gate (items 1-7 + healthy shape) checked mechanically; the unsigned [ ] choices are REQUIRED arguments with no default; tested on synthetic runs only (never opens the holdout)
 - [x] r) One-command DEV-A pipeline (`run_dev_a.py`): probe → assets → daily → opening → fullday → validate → DEV-A → ticks → rerun → gate shortlist → draft `docs/results-DEV-A.md`; stops at NO-GO; rehearsed end-to-end against fake_alpaca
-- [ ] s) SPA size at n ≈ 1,250 days (DEV-A length) by simulation; record the measured rejection rate
+- [x] s) SPA size at n ≈ 1,250 days (DEV-A length) by simulation; record the measured rejection rate
 - [ ] t) Boss review #4
