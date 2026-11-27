@@ -29,6 +29,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
+from functools import lru_cache
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 
@@ -105,6 +106,7 @@ def load_variants(path: str | None) -> list[Variant]:
 
 
 # ----------------------------------------------------------------------------- data
+@lru_cache(maxsize=4096)
 def hm(t: str) -> int:
     h, m = t.split(":")
     return int(h) * 60 + int(m)
@@ -162,7 +164,7 @@ def minute_files(dirpath: str) -> dict[str, str]:
 
 def load_minutes(path: str) -> pd.DataFrame:
     m = pd.read_csv(path, dtype={"ticker": str, "time": str})
-    m["tmin"] = m["time"].map(hm)
+    m["tmin"] = m["time"].map(hm)                 # hm() is lru-cached: ~400 distinct values per file
     return m.sort_values(["ticker", "tmin"]).reset_index(drop=True)
 
 
@@ -244,7 +246,16 @@ def ticks_decide(prices: np.ndarray, side: int, trig_ls: float, stop_ls: float) 
     return bool(after.size and after.min() <= stop_ls + 1e-9)
 
 
-def simulate_trade(bars: pd.DataFrame, side: int, trigger: float, atr: float, k: Knobs,
+class Bars:
+    """One ticker-day of 1-min bars as numpy arrays, sorted by tmin (speed: built once per ticker per day)."""
+    __slots__ = ("t", "o", "h", "l", "c")
+
+    def __init__(self, df: pd.DataFrame):
+        self.t = df["tmin"].to_numpy()
+        self.o, self.h, self.l, self.c = (df[x].to_numpy(dtype=float) for x in ("o", "h", "l", "c"))
+
+
+def simulate_trade(bars, side: int, trigger: float, atr: float, k: Knobs,
                    start_t: int, close_t: int, or_other_side: float, tick_lookup=None) -> TradeResult:
     """Pessimistic 1-min fill model. side=+1 long, -1 short. bars sorted by tmin (RTH).
 
@@ -255,11 +266,18 @@ def simulate_trade(bars: pd.DataFrame, side: int, trigger: float, atr: float, k:
     Breakeven / trailing changes take effect from the NEXT bar after the trigger bar (no same-bar optimism).
     Close: exit at the close of the last bar <= close_t, minus half spread and k.
     """
-    b = bars[(bars["tmin"] >= start_t) & (bars["tmin"] <= close_t)]
-    if b.empty:
-        return TradeResult(False, exit_reason="no_bars")
-    t = b["tmin"].to_numpy()
-    o, h, l, c = (b[x].to_numpy(dtype=float) for x in ("o", "h", "l", "c"))
+    if isinstance(bars, Bars):                      # sorted arrays: slice instead of a boolean mask
+        lo_, hi_ = np.searchsorted(bars.t, start_t, "left"), np.searchsorted(bars.t, close_t, "right")
+        if hi_ <= lo_:
+            return TradeResult(False, exit_reason="no_bars")
+        t = bars.t[lo_:hi_]
+        o, h, l, c = bars.o[lo_:hi_], bars.h[lo_:hi_], bars.l[lo_:hi_], bars.c[lo_:hi_]
+    else:
+        b = bars[(bars["tmin"] >= start_t) & (bars["tmin"] <= close_t)]
+        if b.empty:
+            return TradeResult(False, exit_reason="no_bars")
+        t = b["tmin"].to_numpy()
+        o, h, l, c = (b[x].to_numpy(dtype=float) for x in ("o", "h", "l", "c"))
     # work in "long space": for shorts flip prices so the same code applies
     if side < 0:
         o, h, l, c = -o, -l, -h, -c
@@ -364,8 +382,16 @@ def simulate_trade(bars: pd.DataFrame, side: int, trigger: float, atr: float, k:
 
 
 # ----------------------------------------------------------------------------- one day
-def day_candidates(ot_day: pd.DataFrame, dfe_day: pd.DataFrame, k: Knobs) -> pd.DataFrame:
-    x = ot_day[ot_day["L"] == k.or_minutes].merge(
+def candidate_key(k: Knobs) -> tuple:
+    """Every knob day_candidates() reads: two specs with the same key get the same candidates."""
+    return (k.or_minutes, k.min_price, k.min_avg_vol, k.min_atr, k.rvol_min, k.top_n, k.max_or_range_atr,
+            k.close_loc_min, k.sides)
+
+
+def day_candidates(ot_day: pd.DataFrame, dfe_day: pd.DataFrame, k: Knobs, merged: pd.DataFrame | None = None) \
+        -> pd.DataFrame:
+    """`merged` = the precomputed ot_day[L] x dfe_day join (speed); computed here when not given."""
+    x = merged if merged is not None else ot_day[ot_day["L"] == k.or_minutes].merge(
         dfe_day.rename(columns={"date": "day"}), on=["ticker", "day"], how="inner")
     x = x[x["ticker"] != "SPY"]
     x = x[(x["first_t"] == OPEN_MIN) & (x["nbars"] >= max(1, k.or_minutes - 1))]  # halted / late open -> drop
@@ -477,17 +503,31 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
             continue
         otd, dfd = ot_by_day[day], dfe_by_day[day]
         m = None
+        merged: dict[int, pd.DataFrame] = {}      # per OR length: the ot x daily-features join, once per day
+        cands: dict[tuple, pd.DataFrame] = {}     # per candidate_key: the candidates, once per day
+        full = None
+
+        def cand_for(kk: Knobs) -> pd.DataFrame:
+            key = candidate_key(kk)
+            if key not in cands:
+                if kk.or_minutes not in merged:
+                    merged[kk.or_minutes] = otd[otd["L"] == kk.or_minutes].merge(
+                        dfd.rename(columns={"date": "day"}), on=["ticker", "day"], how="inner")
+                cands[key] = day_candidates(otd, dfd, kk, merged[kk.or_minutes])
+            return cands[key]
+
         for si, (var, null_mode, seed) in enumerate(specs):
             k = var.knobs
             rng = np.random.default_rng(seed + int(day.replace("-", "")))
-            real = day_candidates(otd, dfd, k)
+            real = cand_for(k)
             if null_mode == "random_names":
                 if real.empty:
                     continue
                 if m is None:
                     m = load_minutes(path)
-                full = set(m.groupby("ticker")["tmin"].max().loc[lambda s: s >= FULL_DAY_MIN_LAST_BAR].index)
-                pool = day_candidates(otd, dfd, replace(k, rvol_min=-1.0, top_n=10_000))
+                if full is None:
+                    full = set(m.groupby("ticker")["tmin"].max().loc[lambda s: s >= FULL_DAY_MIN_LAST_BAR].index)
+                pool = cand_for(replace(k, rvol_min=-1.0, top_n=10_000))
                 pool = pool[pool["ticker"].isin(full)]
                 diag["null_pool_sizes"].append(len(pool))
                 cand = pool.sample(n=min(len(real), len(pool)), random_state=int(rng.integers(1 << 31)))
@@ -511,7 +551,7 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
                     diag["days_skipped_data_gap"].append(day)
                 continue
             if "_mb" not in diag or diag["_mb"][0] != day:
-                diag["_mb"] = (day, {tk: g for tk, g in m.groupby("ticker")})
+                diag["_mb"] = (day, {tk: Bars(g) for tk, g in m.groupby("ticker")})
             mb = diag["_mb"][1]
             start_t = OPEN_MIN + (2 if k.entry_bar2 else 1) * k.or_minutes
             for _, r in cand.iterrows():
@@ -527,11 +567,11 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
                 other = r["l"] if side > 0 else r["h"]
                 tl = (lambda mnt, _d=day, _s=r["ticker"]: TICKS.get((_d, _s, mnt))) if TICKS else None
                 if null_mode == "random_entry":
-                    mins = bars["tmin"][(bars["tmin"] >= start_t) & (bars["tmin"] <= hm("10:30"))].to_numpy()
+                    mins = bars.t[(bars.t >= start_t) & (bars.t <= hm("10:30"))]
                     if mins.size == 0:
                         continue
                     t0 = int(rng.choice(mins))
-                    op = float(bars.loc[bars["tmin"] == t0, "o"].iloc[0])
+                    op = float(bars.o[bars.t == t0][0])
                     trig = op - side * TICK    # level just through the open -> fills at the open
                     res = simulate_trade(bars, side, trig, r["atr14"], k, t0, close_t, other)
                 else:
