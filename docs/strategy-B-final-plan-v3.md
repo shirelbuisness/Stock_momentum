@@ -1,5 +1,5 @@
 # Strategy B: final plan v3, loss-reduction track + version testing (27.11.2026, status updated 27.11 evening)
-Builds on `strategy-B-build-plan.md` (rev 2: rules, data path, fill model, risk) and replaces its variant list and testing protocol. Panel for v3: exit/trade-management expert, statistician, ORB practitioner, regime/portfolio researcher. Code: `strategy_b/b_mvb.py` + `strategy_b/fetch_b_data.py` (42 tests pass).
+Builds on `strategy-B-build-plan.md` (rev 2: rules, data path, fill model, risk) and replaces its variant list and testing protocol. Panel for v3: exit/trade-management expert, statistician, ORB practitioner, regime/portfolio researcher. Code: `strategy_b/b_mvb.py` + `strategy_b/fetch_b_data.py` (112 tests pass).
 
 ## 1. Goal, stated honestly
 - **Goal:** profitable after ALL costs, with few losing *months*, not zero losing *trades*.
@@ -57,7 +57,7 @@ Builds on `strategy-B-build-plan.md` (rev 2: rules, data path, fill model, risk)
 ## 6. How to run
 Exact commands, time and disk estimates: `strategy-B-data-runbook.md`. In short:
 ```
-python -m pytest -q                                   # 42 tests must pass first
+python -m pytest -q                                   # 112 tests must pass first
 python fetch_b_data.py probe                          # GO / NO-GO
 python fetch_b_data.py assets | daily | opening | fullday | validate
 python b_mvb.py --daily data/daily.csv --minutes data/minutes --variants variants_b.json \
@@ -68,7 +68,7 @@ python b_mvb.py ...same... --ticks data/ticks.csv
 - **Output:** `runs/<stamp>_B/report.md` + `summary.csv` + `trades.csv` + `config.json`, and one row per variant in `experiments/trials.csv`.
 
 ## 7. Status of the code (verified with synthetic data + a fake Alpaca only)
-- **42 tests pass:**
+- **112 tests pass** (42 before the night of 27.11; the night's additions are in `night-log-2026-11-27.md`):
   - known-answer fills (gap, same-bar stop, 1-tick-through trigger, short mirror, breakeven next-bar only, time stop, cost filter, OR stop cap, OHLC-path same-bar);
   - point-in-time features (split-scaled ATR, RVOL by sessions, RVOL future-perturbation);
   - guards (holdout once, ≤ 2 variants on the holdout, data gaps skipped, half days);
@@ -80,11 +80,11 @@ python b_mvb.py ...same... --ticks data/ticks.csv
   - **tick resolution = the predicted result.**
 - **Independent verifier** (`viz_b.py`) re-derived 626/626 trades in each of 5 versions; it fails on a deliberately wrong rule.
 - **Never run against the real Alpaca API or real market data.** The probe is the first real check.
-- **Not built yet:** SPA, PBO, random-skip null, DSR. They are needed before DEV-B, not before DEV-A.
+- **Built 27.11 night (synthetic-tested only):** DSR (N from the trial log), random-skip null, Hansen SPA, PBO via CSCV, day-block cone, `gate_b.py`. SPA is slightly liberal at n = 300 days (6% at 5%).
 - **Known approximations:** gross R with a partial exit is approximate (partial is unused in v3); the half spread is an assumed 3 bp until calibrated with SIP quotes.
 
 ## 8. Next steps, in order
 1. Probe → download → validate (runbook).
 2. Sign the prereg (rev 3), filling in the open choices.
-3. DEV-A run → ticks → rerun → shortlist → build DSR/SPA/random-skip → DEV-B → holdout once → paper.
+3. DEV-A run → ticks → rerun → `gate_b.py shortlist` → DEV-B → `gate_b.py confirm` → holdout once → paper.
 4. Trader's opening watch (30+ rows): tag each stop-out as chop / market / spread / news; after ~40 sessions, tags that separate winners from losers become new pre-registered knobs.

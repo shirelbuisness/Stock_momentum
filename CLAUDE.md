@@ -5,13 +5,13 @@ Goal: a machine that, after ALL costs, makes more money than it loses. Fail fast
 
 ## Where things stand (27.11.2026)
 - **Strategy B (ORB on Stocks in Play) is the current focus.** It has the strongest published evidence (Zarattini, Barbon & Aziz 2024).
-- Code: `strategy_b/` (standalone; not yet on the shared engine). **42 tests pass.**
+- Code: `strategy_b/` (standalone; not yet on the shared engine). **112 tests pass** (CI runs them on every push: `.github/workflows/tests.yml`).
 - **NOTHING has run on real market data yet.** Every result so far is synthetic. The next step is the real Alpaca probe.
 - Strategy A (6 red candles → reversal) and C (SPY momentum) exist in the claude.ai Project "Stock Momentum's", not here.
   Another cloud session built `scripts/run_all.py` + `src/` for A in a repo that is NOT on GitHub. If it is needed, ask Shirel.
 
 ## Next step (do this first)
-1. `cd strategy_b && python -m pytest -q` → expect `42 passed`.
+1. `pip install -r requirements.txt && cd strategy_b && python -m pytest -q` → expect `112 passed` (~5 min).
 2. Shirel sets `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` (free Alpaca account) in her shell or a gitignored `.env`.
 3. `python fetch_b_data.py probe` → read the output with her: GO / NO-GO, delisted-names line, 500-symbol line.
 4. If GO: follow `docs/strategy-B-data-runbook.md` (assets → daily → opening → fullday → validate → DEV-A run → ticks → rerun).
@@ -24,6 +24,13 @@ Goal: a machine that, after ALL costs, makes more money than it loses. Fail fast
 | `strategy_b/viz_b.py` | Independent re-implementation of the base rules (verifier) + trade screenshots + replay video |
 | `strategy_b/fake_alpaca.py`, `synth.py` | Offline fake Alpaca + seeded synthetic market (tests only) |
 | `strategy_b/variants_b.json` | The 14 frozen versions + base |
+| `strategy_b/gate_stats.py` | DSR, random-skip null, Hansen SPA, PBO (CSCV), expected cone (iid + day-block) |
+| `strategy_b/gate_b.py` | Mechanical DEV-A shortlist / DEV-B confirmation per the prereg |
+| `strategy_b/nyse_calendar.py` | NYSE holidays + 13:00 closes 2015–2023 (default calendar of b_mvb.py) |
+| `strategy_b/dry_run_b.py` | Offline 09:35 selection → order intents file (no broker code) |
+| `strategy_b/paper_vs_cone.py` | Paper (shadow-fill) trades vs the expected cone |
+| `strategy_b/to_parquet.py` | Optional Parquet copy of the data (identical results) |
+| `strategy_b/reference/b_mvb_ref.py` | Frozen pre-speed-work engine; never edit (equivalence test) |
 | `docs/strategy-B-final-plan-v3.md` | Authoritative plan: versions, testing protocol, regime/portfolio |
 | `docs/preregistration-B-draft.md` | Locked rules + pass gate (NOT signed yet; open choices marked [ ]) |
 | `docs/strategy-B-data-runbook.md` | Exact commands, time and disk estimates |
@@ -45,5 +52,6 @@ Goal: a machine that, after ALL costs, makes more money than it loses. Fail fast
 ## Known open issues
 - Alpaca's asset list is today's view, so long-delisted names may be missing (survivorship). The probe measures it.
 - Ticker reuse can mix companies. The ETF filter is a name heuristic.
-- Not built yet: DSR, SPA, PBO, random-skip null (needed before DEV-B, not before DEV-A).
+- Built on the night of 27.11 (synthetic-tested only): DSR, random-skip null, Hansen SPA, PBO, day-block cone, `gate_b.py`, NYSE calendar, short shadow, dry run, Parquet. See `docs/night-log-2026-11-27.md`.
+- The cloud environment blocks `data.alpaca.markets` and has no keys: the real run must happen on Shirel's machine, or after the host + key are added to the environment.
 - The prereg must still pick: the Sharpe sizing, the breakeven-slippage threshold (1 or 2 ticks), the net-R bar (+0.05R or +0.08R), and the cost-filter multiple (3× or 5×).

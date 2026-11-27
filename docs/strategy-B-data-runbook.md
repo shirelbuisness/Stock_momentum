@@ -1,12 +1,12 @@
 # Strategy B: data runbook (Alpaca free plan, SIP) → first real number
-Code: `strategy_b/fetch_b_data.py` (downloader), `strategy_b/b_mvb.py` (backtester). Tests: `test_fetch_b_data.py` + `test_b_mvb.py`, **42 pass** against an in-process fake Alpaca (`strategy_b/fake_alpaca.py`). It has never been run against the real API; step 1 below is that check. Run every command from inside `strategy_b/`.
+Code: `strategy_b/fetch_b_data.py` (downloader), `strategy_b/b_mvb.py` (backtester). Tests: all `strategy_b/test_*.py`, **112 pass** against an in-process fake Alpaca (`strategy_b/fake_alpaca.py`). It has never been run against the real API; step 1 below is that check. Run every command from inside `strategy_b/`.
 
 ## 0. Setup (once)
 ```
-pip install pandas numpy scipy matplotlib pytest
+pip install -r requirements.txt      # from the repo root
 export APCA_API_KEY_ID=...      # free Alpaca account (paper is fine)
 export APCA_API_SECRET_KEY=...
-python -m pytest -q             # must print "42 passed" before touching the real API
+python -m pytest -q             # must print "112 passed" before touching the real API
 ```
 (Windows PowerShell: `$env:APCA_API_KEY_ID="..."` instead of `export`.)
 
@@ -45,6 +45,8 @@ python b_mvb.py --daily data/daily.csv --minutes data/minutes --variants variant
 - Expected runtime: 1–3 h.
 - **Read first:** the "Data diagnostics" section (data-gap days, the null pool), then the base row: mean R net, the same-bar share, and **mean R if same-bar = OHLC path**.
 
+- **New in the report (night 27.11):** "Gate statistics" (N trials, DSR per version, random-skip p for filters, Hansen SPA, PBO), breakeven in bp as well as ticks (`--breakeven`), scratches apart from wins/losses, the NYSE calendar used (bundled by default; half days exit on the 12:58 bar; a file ending 12:59 on a full day = data gap), the short shadow (add `--securities data/securities.csv` for ETB flags) and the expected cone (`expected_cone.json`).
+
 ## 4. Resolve the ambiguous minutes with real prints (finding R9)
 ```
 python fetch_b_data.py ticks --trades runs/<DEV-A run>/trades.csv
@@ -53,6 +55,18 @@ python b_mvb.py ... same as step 3 ... --ticks data/ticks.csv
 - Calls: about 1 per (day, entry minute) with an ambiguous trade, a few thousand.
 - The report column "of which resolved by ticks %" should be close to 100%. Whatever is not resolved stays pessimistic.
 - **Decide between base and the stop variants only on the tick-resolved run.**
+
+## 5. Shortlist and confirm (mechanical)
+```
+python gate_b.py shortlist --dev-a runs/<DEV-A tick-resolved run>
+python gate_b.py confirm   --dev-a runs/<DEV-A run> --dev-b runs/<DEV-B run with --stress>
+```
+Stop versions are only shortlisted from a `--ticks` run (R9); SPA p > 0.10 empties the shortlist (plan v3).
+
+## 6. Optional tools
+- `python to_parquet.py --src data --dst data_parquet` → then `--daily data_parquet/daily.parquet --minutes data_parquet/minutes` (identical results, smaller files; needs pyarrow).
+- `python dry_run_b.py --data data --day 2019-02-22` → the 09:35 order intents for a DEV day, written to a file (no broker code).
+- `python paper_vs_cone.py --run runs/<run> --paper paper_trades.csv` → paper shadow fills vs the day-block cone.
 
 ## Design decisions in the downloader (and why)
 - **One symbol mapping everywhere (Alpaca default = today's ticker).** Mixing in per-day `asof` labels the same company differently across files (a boss-review finding; a test guards it).
@@ -65,4 +79,5 @@ python b_mvb.py ... same as step 3 ... --ticks data/ticks.csv
 - **Survivorship:** Alpaca's asset list is today's view (active + inactive). Names delisted long ago may be missing. The probe measures this.
 - **Ticker reuse** under today's mapping can mix two companies (Alpaca forum case "Q"). Spot-check suspicious names.
 - **ETF filter is a name heuristic.** It also removes some "Trust" operating companies.
-- **Disk:** CSV is large. Parquet would be 5–10× smaller, but pyarrow is not assumed installed.
+- **Disk:** CSV is large. `to_parquet.py` makes an optional Parquet copy (needs pyarrow).
+- **Daily end date:** the daily stage now sends explicit NY timestamps; a date-only end could drop the end day (Dec 31 is a trading day in 2015 and 2018–2021).

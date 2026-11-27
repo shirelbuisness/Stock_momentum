@@ -1,5 +1,12 @@
 # Build log: Strategy B backtester (`strategy_b/b_mvb.py`) and downloader (`strategy_b/fetch_b_data.py`)
 
+## Round 4: unattended night session (27.11.2026). Details: `night-log-2026-11-27.md`
+- Gate tools built: DSR, random-skip null, Hansen SPA, PBO (CSCV), expected cone (iid + day-block), `gate_b.py`.
+- NYSE calendar 2015–2023 is now the default; breakeven in bp; scratches; short shadow (SSR/ETB); 09:35 dry run (no broker code); Parquet option; CI on every push.
+- Speed 2.6× with bit-identical results (frozen reference engine + equivalence test).
+- **Boss findings fixed:** (1) the independent verifier did not know half days; (2) the daily download could drop its end day (Dec 31 in 2015, 2018–2021) if the API reads a date-only `end` as 00:00 UTC; (3) the calendar state leaked between runs in one process.
+- **112 tests pass** (CI green). Still never run on real data (no keys; host blocked in the cloud environment).
+
 ## Round 3: downloader + tick resolution (27.11.2026)
 - `fetch_b_data.py`: probe, assets, daily (+ splits), opening, fullday (top-100 + 30 random + SPY), validate (data gate), ticks.
 - `fake_alpaca.py`: an in-process fake of the Alpaca endpoints, used only by the tests.
@@ -67,9 +74,9 @@
 
 ### Open, not fixed in code
 - **ETFs/ADRs:** the downloader's name heuristic is the only filter.
-- **Breakeven slippage is in ticks only.** For a $200 stock the tick grid understates cost.
-- A breakeven exit (net 0) counts as a loss in win%.
+- ~~Breakeven slippage is in ticks only~~ → bp added in Round 4.
+- A breakeven exit (net 0) counts as a loss in win% → Round 4 reports scratches (|R| ≤ 0.05) apart; old win% kept.
 - **F9 (15-min OR) ranks by 15-min RVOL.** The paper does not say which it used; decide at signing.
-- **Gate tools not built:** DSR, 1,000 nulls, random-skip null, SPA, PBO. Build them before DEV-B.
+- ~~Gate tools not built~~ → built in Round 4 (DSR, random-skip, SPA, PBO). Still open: 1,000 random-entry/names nulls is just `--nulls 1000` (slow, not timed on real data).
 - **The prereg must specify the Sharpe sizing.** Proposal: equal notional 1/N, as implemented.
 - **The cost model uses IBKR commission while paper runs on Alpaca (commission-free).** That is pessimistic, so keep it, but say so.
