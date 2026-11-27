@@ -2,7 +2,7 @@
 
 Work top to bottom. Mark `[x]` when done (commit + push after each).
 
-- [ ] a) DSR from experiments/trials.csv, random-skip null, Hansen SPA, PBO via CSCV — all in b_mvb.py's report, with tests
+- [x] a) DSR from experiments/trials.csv, random-skip null, Hansen SPA, PBO via CSCV — all in b_mvb.py's report, with tests
 - [ ] b) NYSE early-closes calendar 2015–2023, with tests
 - [ ] c) Breakeven slippage in bp + scratches reported separately
 - [ ] d) Monte Carlo expected cone per run

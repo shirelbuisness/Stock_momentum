@@ -559,13 +559,7 @@ def daily_paired_nw(var_tr: pd.DataFrame, base_tr: pd.DataFrame, all_days: list[
     Days with no trades count as 0. Newey-West SE with `lags` lags. Returns a two-sided normal p."""
     from scipy import stats
 
-    def dsum(tr):
-        if tr is None or tr.empty:
-            return pd.Series(0.0, index=all_days)
-        f = tr[tr["filled"]]
-        return f.groupby("day")["r_net"].sum().reindex(all_days, fill_value=0.0)
-
-    d = (dsum(var_tr) - dsum(base_tr)).to_numpy()
+    d = (daily_R(var_tr, all_days) - daily_R(base_tr, all_days)).to_numpy()
     n = len(d)
     if n < 10:
         return {"d_day": np.nan, "t_nw": np.nan, "p": np.nan}
@@ -591,6 +585,22 @@ def holm(pvals: list[float]) -> list[float]:
     return adj
 
 
+def daily_R(tr: pd.DataFrame | None, all_days: list[str]) -> pd.Series:
+    """Sum of net R per day (equal $ risk per trade); days without trades = 0."""
+    if tr is None or tr.empty or not tr["filled"].any():
+        return pd.Series(0.0, index=all_days)
+    f = tr[tr["filled"]]
+    return f.groupby("day")["r_net"].sum().reindex(all_days, fill_value=0.0)
+
+
+def daily_ret_1x(tr: pd.DataFrame | None, all_days: list[str], top_n: int) -> pd.Series:
+    """1x portfolio daily return: equal notional 1/top_n per position; days without trades = 0."""
+    if tr is None or tr.empty or not tr["filled"].any():
+        return pd.Series(0.0, index=all_days)
+    f = tr[tr["filled"]]
+    return (f.groupby("day")["ret_net"].sum() / top_n).reindex(all_days, fill_value=0.0)
+
+
 def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
     f = tr[tr["filled"]] if not tr.empty and "filled" in tr else tr.head(0)
     out = {"signals": int(len(tr)), "trades": int(len(f))}
@@ -614,7 +624,7 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
         cost_R=(f["r_gross"] - f["r_net"]).mean(),
     )
     # 1x portfolio: equal notional 1/top_n per position, days without trades = 0
-    daily = (f.groupby("day")["ret_net"].sum() / top_n).reindex(all_days, fill_value=0.0)
+    daily = daily_ret_1x(tr, all_days, top_n)
     sd = daily.std(ddof=1)
     out["sharpe_1x"] = daily.mean() / sd * math.sqrt(252) if sd > 0 else np.nan
     out["ann_ret_1x"] = daily.mean() * 252
@@ -667,6 +677,42 @@ def breakeven_from(results: list[pd.DataFrame]) -> float:
     return np.inf
 
 
+# ----------------------------------------------------------------------------- gate statistics
+def gate_statistics(variants: list[Variant], results: list[pd.DataFrame], idx: dict, rows: list[dict],
+                    all_days: list[str], a) -> dict:
+    """DSR (per version, N from the trial log + this run), random-skip null (filters), Hansen SPA (best vs base),
+    PBO via CSCV (all versions). Writes dsr / rs_* into `rows` (the summary) and returns the run-level numbers."""
+    import gate_stats as G
+    prev = []
+    if os.path.exists(a.trial_log):
+        log = pd.read_csv(a.trial_log, dtype=str)
+        prev = log["sharpe_1x"].tolist() if "sharpe_1x" in log else [""] * len(log)
+    n_trials, var_sr = G.trial_sharpe_stats(prev, [s.get("sharpe_1x", "") for s in rows])
+    sr0 = G.expected_max_sharpe(n_trials, var_sr)
+    base_tr = results[idx[("var", variants[0].id)]]
+    bf = base_tr[base_tr["filled"]] if not base_tr.empty else base_tr
+    dR = {}
+    for i, (v, s) in enumerate(zip(variants, rows)):
+        tr = results[idx[("var", v.id)]]
+        d = G.deflated_sharpe(daily_ret_1x(tr, all_days, v.knobs.top_n).to_numpy(), n_trials, var_sr)
+        s["dsr"] = d["dsr"]
+        dR[v.id] = daily_R(tr, all_days).to_numpy()
+        if i > 0 and not bf.empty:
+            vf = tr[tr["filled"]] if not tr.empty else tr
+            s.update(G.random_skip_null(bf["r_net"].to_numpy(), vf["r_net"].to_numpy() if not vf.empty else [],
+                                        bf["day"].to_numpy(), int(vf["day"].nunique()) if not vf.empty else 0,
+                                        reps=a.gate_reps, seed=a.seed + i))
+    out = dict(n_trials=n_trials, var_sr=var_sr, sr0_day=sr0)
+    if len(variants) > 1:
+        ids = [v.id for v in variants[1:]]
+        diff = np.column_stack([dR[i] - dR[variants[0].id] for i in ids])
+        sp = G.spa_test(diff, reps=a.gate_reps, mean_block=a.spa_block, seed=a.seed)
+        out.update(spa_p=sp["spa_p"], spa_best=ids[sp["spa_best"]] if sp["spa_best"] is not None else None)
+        pb = G.pbo_cscv(np.column_stack([dR[v.id] for v in variants]), a.pbo_blocks)
+        out.update(pbo=pb["pbo"], pbo_splits=pb["splits"], pbo_blocks=pb["blocks"])
+    return out
+
+
 # ----------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -685,6 +731,9 @@ def main(argv=None):
     ap.add_argument("--early-closes", default=None, help="CSV date,close (e.g. 2019-11-29,13:00)")
     ap.add_argument("--ticks", default=None, help="ticks.csv from `fetch_b_data.py ticks`: resolves same-minute "
                                                   "entry+stop trades from real prints")
+    ap.add_argument("--gate-reps", type=int, default=1000, help="bootstrap / random-skip repetitions (DSR/SPA/PBO)")
+    ap.add_argument("--spa-block", type=float, default=10.0, help="mean block length (days) of the SPA bootstrap")
+    ap.add_argument("--pbo-blocks", type=int, default=16, help="CSCV blocks for PBO (even)")
     a = ap.parse_args(argv)
     TICKS.clear()
     if a.ticks:
@@ -783,6 +832,8 @@ def main(argv=None):
         print(f"[{v.id}] trades={s.get('trades', 0)} meanR_net={s.get('mean_R_net', float('nan')):.3f} "
               f"t={s.get('t_net', float('nan')):.2f}", flush=True)
 
+    gate = gate_statistics(variants, results, idx, rows, all_days, a)
+
     null_rows = []
     if a.nulls > 0:
         for mode in ["random_entry", "random_names"]:
@@ -806,7 +857,7 @@ def main(argv=None):
     with open(os.path.join(outdir, "config.json"), "w") as f:
         json.dump(dict(args=vars(a), variants=[dict(id=v.id, knobs=asdict(v.knobs), note=v.note) for v in variants],
                        data_fingerprint=fp), f, indent=2)
-    write_report(outdir, summ, null_rows, base_tr, a, fp, diag)
+    write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
     with open(a.trial_log, "a") as f:
@@ -827,8 +878,9 @@ def fmt(x, nd=3):
     return str(x)
 
 
-def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None):
+def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
     diag = diag or {}
+    gate = gate or {}
     cols = [("id", "variant"), ("trades", "trades"), ("win_rate", "win%"), ("avg_win_R", "avg win R"),
             ("avg_loss_R", "avg loss R"), ("mean_R_net", "mean R net"), ("t_net", "t (day-clustered)"),
             ("mean_R_gross", "mean R gross"), ("cost_R", "cost R/trade"), ("profit_factor", "PF"),
@@ -840,7 +892,8 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None):
             ("quarters_pos", "quarters +"), ("longest_losing_streak", "longest losing streak"),
             ("top5pct_share_of_wins", "top-5% share of wins"),
             ("dR_vs_base", "ΔR/trade vs base"), ("t_vs_base", "t vs base"),
-            ("dR_per_day_vs_base", "ΔR/day vs base"), ("t_nw_vs_base", "t NW (day)"), ("p_holm", "p Holm")]
+            ("dR_per_day_vs_base", "ΔR/day vs base"), ("t_nw_vs_base", "t NW (day)"), ("p_holm", "p Holm"),
+            ("dsr", "DSR"), ("rs_p_trades", "random-skip p (trades)"), ("rs_p_days", "random-skip p (days)")]
     cols = [c for c in cols if c[0] in summ]
     L = [f"# Strategy B backtest {a.start} → {a.end}", "",
          f"Data fingerprint `{fp}`. All numbers are AFTER commission + half spread + slippage unless labelled gross.",
@@ -875,6 +928,21 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None):
             L.append(f"| {yr} | {int(rr['count'])} | {rr['mean']:.3f} |")
         if "exit_mix" in summ.columns:
             L += ["", f"Exit mix (baseline): {summ.iloc[0]['exit_mix']}"]
+    if gate:
+        L += ["", "## Gate statistics (multiple testing / overfitting)", "",
+              f"- **Trials in the log (N for the DSR, this run included): {gate['n_trials']}**; cross-trial variance of "
+              f"the daily Sharpe: {fmt(gate['var_sr'], 6)}; expected max daily Sharpe under H0: "
+              f"{fmt(gate['sr0_day'], 4)} (annualised {fmt(gate['sr0_day'] * math.sqrt(252), 2)}).",
+              "- DSR = P(true Sharpe > that expected maximum), on the 1× equal-notional daily returns. Gate: ≥ 0.95.",
+              "- Random-skip p: share of random subsets of the base's trades (same count) or days (same count) whose "
+              "mean net R ≥ the variant's. Only for versions that keep fewer trades than base (filters). Gate: < 0.05.",
+              f"- Hansen SPA (best variant vs base, daily net R, stationary bootstrap, block {a.spa_block:g} d, "
+              f"{a.gate_reps} reps): **p = {fmt(gate.get('spa_p'))}**"
+              + (f", best = `{gate['spa_best']}`" if gate.get("spa_best") else "")
+              + ". p > 0.10 → nothing beats base.",
+              f"- PBO via CSCV ({gate.get('pbo_blocks', 0)} blocks, {gate.get('pbo_splits', 0)} splits, all "
+              f"{len(summ)} versions, daily net R Sharpe): **PBO = {fmt(gate.get('pbo'))}**. > 0.3 → the search is "
+              "overfit."]
     L += ["", "## Reading rules", "- Not preregistered yet: treat t < 3 as 'not worth pursuing' (rigor skill §5).",
           "- A variant beats the base only with t_vs_base > 2 AND wins again on the next period's fresh data.",
           "- Breakeven ticks/side < 2 → B as specified does not get deployed (plan §4).",
