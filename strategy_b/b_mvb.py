@@ -627,7 +627,10 @@ def daily_ret_1x(tr: pd.DataFrame | None, all_days: list[str], top_n: int) -> pd
     return (f.groupby("day")["ret_net"].sum() / top_n).reindex(all_days, fill_value=0.0)
 
 
-def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
+SCRATCH_R = 0.05   # |net R| <= this = a scratch (neither win nor loss); proposal, team to confirm
+
+
+def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int, scratch_r: float = SCRATCH_R) -> dict:
     f = tr[tr["filled"]] if not tr.empty and "filled" in tr else tr.head(0)
     out = {"signals": int(len(tr)), "trades": int(len(f))}
     if f.empty:
@@ -648,6 +651,11 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
         ambiguous_resolved_by_ticks=float((f["same_bar_source"] == "ticks").sum()
                                           / max(1, (f["same_bar_source"].fillna("") != "").sum())),
         cost_R=(f["r_gross"] - f["r_net"]).mean(),
+        # scratches reported apart: a breakeven exit nets ~0 after costs and is neither a win nor a loss
+        scratch_pct=float((r.abs() <= scratch_r).mean()),
+        win_pct_ex_scratch=float((r > scratch_r).mean()),
+        loss_pct_ex_scratch=float((r < -scratch_r).mean()),
+        scratch_sum_R=float(r[r.abs() <= scratch_r].sum()),
     )
     # 1x portfolio: equal notional 1/top_n per position, days without trades = 0
     daily = daily_ret_1x(tr, all_days, top_n)
@@ -678,28 +686,34 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
 
 
 BE_TICKS = [0, 1, 2, 3, 4]
+BE_BPS = [0.0, 2.5, 5.0, 10.0, 20.0, 40.0]
 
 
-def breakeven_specs(var: Variant) -> list[tuple[Variant, str, int]]:
+def breakeven_specs(var: Variant, unit: str = "ticks") -> list[tuple[Variant, str, int]]:
+    """Copies of `var` with slippage per side = x ticks (slip_bp off) or x bp (slip_ticks off)."""
+    if unit == "bp":
+        return [(Variant(var.id, replace(var.knobs, slip_ticks=0.0, slip_bp=x)), "", 0) for x in BE_BPS]
     return [(Variant(var.id, replace(var.knobs, slip_ticks=kt, slip_bp=0.0)), "", 0) for kt in BE_TICKS]
 
 
-def breakeven_from(results: list[pd.DataFrame]) -> float:
-    """Extra slippage per side (ticks, on top of commission + half spread) at which mean net R = 0.
-    Interpolates over k = 0..4 ticks (slip_bp off). np.inf if still positive at 4 ticks."""
-    xs, ys = [], []
-    for kt, s in zip(BE_TICKS, results):
+def breakeven_from(results: list[pd.DataFrame], xs: list[float] | None = None) -> float:
+    """Extra slippage per side (on top of commission + half spread) at which mean net R = 0, interpolated
+    linearly over the grid `xs` (default BE_TICKS = 0..4 ticks; BE_BPS for basis points).
+    0 if already <= 0 with no slippage; np.inf if still positive at the top of the grid."""
+    xs_grid = BE_TICKS if xs is None else xs
+    xs_, ys = [], []
+    for kt, s in zip(xs_grid, results):
         f = s[s["filled"]]
         if f.empty:
             return np.nan
-        xs.append(kt)
+        xs_.append(kt)
         ys.append(f["r_net"].mean())
     ys = np.array(ys)
     if ys[0] <= 0:
         return 0.0
-    for i in range(1, len(xs)):
+    for i in range(1, len(xs_)):
         if ys[i] <= 0:
-            return xs[i - 1] + ys[i - 1] / (ys[i - 1] - ys[i]) * (xs[i] - xs[i - 1])
+            return xs_[i - 1] + ys[i - 1] / (ys[i - 1] - ys[i]) * (xs_[i] - xs_[i - 1])
     return np.inf
 
 
@@ -772,6 +786,7 @@ def _main(argv=None):
                          "'none' = infer half days from the last bar")
     ap.add_argument("--ticks", default=None, help="ticks.csv from `fetch_b_data.py ticks`: resolves same-minute "
                                                   "entry+stop trades from real prints")
+    ap.add_argument("--scratch-r", type=float, default=SCRATCH_R, help="|net R| <= this counts as a scratch")
     ap.add_argument("--gate-reps", type=int, default=1000, help="bootstrap / random-skip repetitions (DSR/SPA/PBO)")
     ap.add_argument("--spa-block", type=float, default=10.0, help="mean block length (days) of the SPA bootstrap")
     ap.add_argument("--pbo-blocks", type=int, default=16, help="CSCV blocks for PBO (even)")
@@ -853,6 +868,10 @@ def _main(argv=None):
         if a.breakeven:
             for kt, sp in zip(BE_TICKS, breakeven_specs(v)):
                 add(("be", v.id, kt), sp)
+            for x, sp in zip(BE_BPS, breakeven_specs(v, "bp")):
+                if x == 0:
+                    continue                      # identical to 0 ticks: reuse that run
+                add(("be_bp", v.id, x), sp)
     for mode in (["random_entry", "random_names"] if a.nulls > 0 else []):
         for rep in range(a.nulls):
             add(("null", mode, rep), (variants[0], mode, a.seed + 1000 * rep))
@@ -865,7 +884,7 @@ def _main(argv=None):
     base_tr = results[idx[("var", variants[0].id)]]
     for i, v in enumerate(variants):
         tr = results[idx[("var", v.id)]]
-        s = summarize(tr, all_days, v.knobs.top_n)
+        s = summarize(tr, all_days, v.knobs.top_n, a.scratch_r)
         s.update(id=v.id, note=v.note)
         if i > 0:
             pdlt = paired_delta(tr, base_tr)
@@ -874,6 +893,8 @@ def _main(argv=None):
             s["dR_per_day_vs_base"], s["t_nw_vs_base"], s["p_vs_base"] = nw["d_day"], nw["t_nw"], nw["p"]
         if a.breakeven:
             s["breakeven_ticks"] = breakeven_from([results[idx[("be", v.id, kt)]] for kt in BE_TICKS])
+            s["breakeven_bp"] = breakeven_from(
+                [results[idx[("be", v.id, 0) if x == 0 else ("be_bp", v.id, x)]] for x in BE_BPS], BE_BPS)
         if a.stress:
             fs = results[idx[("stress", v.id)]]
             fs = fs[fs["filled"]]
@@ -936,13 +957,16 @@ def fmt(x, nd=3):
 def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
     diag = diag or {}
     gate = gate or {}
-    cols = [("id", "variant"), ("trades", "trades"), ("win_rate", "win%"), ("avg_win_R", "avg win R"),
+    cols = [("id", "variant"), ("trades", "trades"), ("win_rate", "win%"),
+            ("win_pct_ex_scratch", "win% ex scratch"), ("scratch_pct", "scratch%"),
+            ("loss_pct_ex_scratch", "loss% ex scratch"), ("avg_win_R", "avg win R"),
             ("avg_loss_R", "avg loss R"), ("mean_R_net", "mean R net"), ("t_net", "t (day-clustered)"),
             ("mean_R_gross", "mean R gross"), ("cost_R", "cost R/trade"), ("profit_factor", "PF"),
             ("pct_pos_months", "% pos months"), ("max_dd_R", "max DD (R)"), ("sharpe_1x", "Sharpe 1x"),
             ("max_dd_1x", "max DD 1x"), ("same_bar_stop_pct", "same-bar stop %"),
             ("ambiguous_pct", "ambiguous entry bars %"), ("ambiguous_resolved_by_ticks", "of which resolved by ticks %"),
-            ("breakeven_ticks", "breakeven ticks/side"), ("mean_R_net_2x_slip", "mean R @2x slip"),
+            ("breakeven_ticks", "breakeven ticks/side"),
+            ("breakeven_bp", "breakeven bp/side"), ("mean_R_net_2x_slip", "mean R @2x slip"),
             ("mean_R_net_ohlc_path", "mean R if same-bar = OHLC path"),
             ("quarters_pos", "quarters +"), ("longest_losing_streak", "longest losing streak"),
             ("top5pct_share_of_wins", "top-5% share of wins"),
@@ -954,6 +978,9 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
          f"Data fingerprint `{fp}`. All numbers are AFTER commission + half spread + slippage unless labelled gross.",
          "Win rate and averages are per trade. Mean R assumes the SAME $ risk per trade; Sharpe and drawdown 1× use",
          "EQUAL NOTIONAL (1/top_n of equity per name). The two sizings differ; read each metric with its own sizing.",
+         f"win% = net R > 0 (old definition). Scratch = |net R| ≤ {a.scratch_r:g}R, reported apart from wins and losses.",
+         "Breakeven slippage = extra slippage per side on top of commission + half spread at which mean net R = 0, "
+         "in ticks (grid 0-4) and in bp (grid 0-40; for a $200 stock 1 tick = 0.5 bp, for a $10 stock 10 bp).",
          "", "| " + " | ".join(c[1] for c in cols) + " |", "|" + "---|" * len(cols)]
     gaps = diag.get("days_skipped_data_gap", [])
     pools = diag.get("null_pool_sizes", [])
@@ -969,7 +996,7 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
                     "If full-day bars exist only for top-RVOL names, this null is NOT random and H2 is untested "
                     "(data plan: also download full-day bars for a seeded random sample of eligible names).")
     for _, r in summ.iterrows():
-        pct_cols = {"win_rate", "pct_pos_months", "same_bar_stop_pct", "ambiguous_pct", "ambiguous_resolved_by_ticks"}
+        pct_cols = {"win_rate", "win_pct_ex_scratch", "scratch_pct", "loss_pct_ex_scratch", "pct_pos_months", "same_bar_stop_pct", "ambiguous_pct", "ambiguous_resolved_by_ticks"}
         L.append("| " + " | ".join(fmt(r.get(c[0])) if c[0] not in pct_cols
                                    else (f"{100*r.get(c[0]):.1f}" if pd.notna(r.get(c[0])) else "–") for c in cols) + " |")
     L += ["", "## Data diagnostics", ""] + warn

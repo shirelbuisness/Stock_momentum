@@ -310,3 +310,42 @@ def test_random_walk_has_no_gross_edge(tmp_path):
 def test_planted_momentum_is_detected(tmp_path):
     f, t = _run(tmp_path, momentum=0.6, seed=12)
     assert t > 3, f"planted edge not found (t={t:.2f})"
+
+
+# ------------------------------------------------------------------ night 27.11: breakeven bp + scratches
+def _fake_runs(means):
+    return [pd.DataFrame({"filled": [True, True], "r_net": [m - 0.1, m + 0.1]}) for m in means]
+
+
+def test_breakeven_bp_interpolates_on_the_bp_grid():
+    # mean R over BE_BPS = 0, 2.5, 5, 10, 20, 40 bp: 0.30, 0.20, 0.10, -0.10, ... -> zero at 5 + 0.1/0.2*5 = 7.5 bp
+    runs = _fake_runs([0.30, 0.20, 0.10, -0.10, -0.5, -1.0])
+    assert B.breakeven_from(runs, B.BE_BPS) == pytest.approx(7.5)
+    assert B.breakeven_from(_fake_runs([0.3] * 6), B.BE_BPS) == np.inf
+    assert B.breakeven_from(_fake_runs([-0.01] * 6), B.BE_BPS) == 0.0
+    assert B.breakeven_from(_fake_runs([0.4, 0.3, 0.2, 0.1, -0.1])) == pytest.approx(3.5)   # ticks (default grid)
+
+
+def test_breakeven_bp_matches_ticks_through_the_price_level(tmp_path):
+    make_market(str(tmp_path), n_tickers=40, n_days=45, seed=23, momentum=0.04)
+    v = _write_variants(tmp_path, [{"id": "b", "knobs": {"min_avg_vol": 0, "sides": "both"}}])
+    out = B.main(["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"),
+                  "--start", "2019-01-23", "--end", "2019-12-31", "--nulls", "0", "--breakeven", "--variants", v,
+                  "--gate-reps", "50", "--out", str(tmp_path / "runs"), "--trial-log", str(tmp_path / "t.csv")])
+    s = pd.read_csv(os.path.join(out, "summary.csv")).iloc[0]
+    tr = pd.read_csv(os.path.join(out, "trades.csv"))
+    f = tr[tr["filled"]]
+    bp_per_tick = 1e4 * B.TICK / f["entry_px"].abs()
+    assert np.isfinite(s["breakeven_bp"]) and np.isfinite(s["breakeven_ticks"]) and s["breakeven_ticks"] > 0
+    ratio = s["breakeven_bp"] / s["breakeven_ticks"]                 # bp per tick implied by the two grids
+    assert bp_per_tick.min() * 0.8 <= ratio <= bp_per_tick.max() * 1.2
+
+
+def test_scratches_are_counted_apart_from_wins_and_losses():
+    tr = pd.DataFrame(dict(filled=True, r_net=[2.0, 0.03, -0.02, 0.0, -1.0, -1.0], r_gross=0.0, day="2019-01-02",
+                           entry_t=575, same_bar_stop=False, same_bar_source="", ret_net=0.0, reason="close"))
+    s = B.summarize(tr, ["2019-01-02"], 20, scratch_r=0.05)
+    assert s["win_rate"] == pytest.approx(2 / 6)                    # old definition: r > 0
+    assert s["scratch_pct"] == pytest.approx(3 / 6)
+    assert s["win_pct_ex_scratch"] == pytest.approx(1 / 6) and s["loss_pct_ex_scratch"] == pytest.approx(2 / 6)
+    assert s["scratch_sum_R"] == pytest.approx(0.01)
