@@ -863,6 +863,19 @@ def gate_statistics(variants: list[Variant], results: list[pd.DataFrame], idx: d
     return out
 
 
+def base_market_exposure(base_tr, all_days: list[str], k: Knobs, daily: pd.DataFrame, ot: pd.DataFrame) -> dict:
+    """Plan v3 §5: the base's daily P&L vs SPY open -> close, and on F8's red-signal days (beta_b.py)."""
+    import beta_b
+    spy = daily[daily["ticker"] == "SPY"].set_index("date")
+    oc = (spy["close"] / spy["open"] - 1).reindex(all_days)
+    so = ot[(ot["ticker"] == "SPY") & (ot["L"] == k.or_minutes)].set_index("day")["c"] if not ot.empty \
+        else pd.Series(dtype=float)
+    prev = pd.Series(SPY_PREV, dtype=float)
+    sig = np.sign(so.reindex(all_days) - prev.reindex(all_days))
+    return beta_b.market_exposure(daily_ret_1x(base_tr, all_days, k.top_n).to_numpy(),
+                                  daily_R(base_tr, all_days).to_numpy(), oc.to_numpy(), sig.to_numpy())
+
+
 # ----------------------------------------------------------------------------- main
 def main(argv=None):
     """Run, then restore the module-level calendar state (EARLY_CLOSES / CAL_STATE) whatever happens."""
@@ -1076,12 +1089,13 @@ def _main(argv=None):
             iid=G.expected_cone(f["r_net"].to_numpy() if not f.empty else [], seed=a.seed + i))
     with open(os.path.join(outdir, "expected_cone.json"), "w") as f:
         json.dump(dict(run=stamp, data_fingerprint=fp, start=a.start, end=a.end, versions=cones), f, indent=2)
+    gate["beta"] = base_market_exposure(base_tr, all_days, variants[0].knobs, daily, ot)
     gate["cone_base"] = cones[variants[0].id]["day_block"]
     gate["cone_base_iid"] = cones[variants[0].id]["iid"]
     gate["shadow"] = shadow
     with open(os.path.join(outdir, "gate.json"), "w") as f:          # run-level gate numbers for gate_b.py
         json.dump({k_: gate.get(k_) for k_ in ("n_trials", "var_sr", "sr0_day", "spa_p", "spa_best", "pbo",
-                                                "pbo_splits", "pbo_blocks")}, f, indent=2, default=float)
+                                                "pbo_splits", "pbo_blocks", "beta")}, f, indent=2, default=float)
     write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
@@ -1192,6 +1206,22 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
         for h, x in cone["horizons"].items():
             y = iid.get(h, {}).get("cum_R", [np.nan] * 3)
             L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"] + [y[0], y[2]]) + " |")
+    be = gate.get("beta") or {}
+    if be.get("days", 0) >= 3 and "beta" in be:
+        L += ["", "## Market exposure of the base (plan v3 §5; diagnostic, not a verdict)", "",
+              f"OLS of the base 1× daily net return on SPY open → close (raw daily bars; B exits at 15:58), "
+              f"{be['days']} days ({be['days_without_spy']} without SPY data left out): **beta = {fmt(be['beta'])}** "
+              f"(NW t {fmt(be['beta_t_nw'], 2)}), corr {fmt(be['corr'])}, alpha {fmt(1e4 * be['alpha_day'], 2)} bp/day.",
+              "", "| SPY day | days | mean base net R/day | t (days) |", "|---|---|---|---|"]
+        for key, lab in (("spy_up", "up (open → close > 0)"), ("spy_down", "down"),
+                         ("spy_worst5pct", "worst 5%"), ("f8_red", "F8 red signal (prior close → OR close < 0)")):
+            if f"n_{key}" in be:
+                L.append(f"| {lab} | {be[f'n_{key}']} | {fmt(be[f'R_day_{key}'])} | {fmt(be[f't_{key}'], 2)} |")
+        if "total_R" in be:
+            L += ["", f"F8 arithmetic on the base's own trades (diagnostic; F8 itself is version "
+                  f"`spy_filter=true`): total {fmt(be['total_R'], 1)} R; skip red-signal days "
+                  f"{fmt(be['total_R_skip_red'], 1)} R; half size on them {fmt(be['total_R_half_red'], 1)} R. "
+                  "Plan v3 §5: F8 helps only if long P&L on red-signal days is negative after costs."]
     sh = gate.get("shadow")
     if sh:
         L += ["", "## Short shadow (backtest only; never a verdict, never traded)", "",
