@@ -20,7 +20,9 @@ Inputs
                      gapped through, the stop, or the exit bar's close); fill_px = the real paper fill.
                      Realised cost/share = side * (fill_px - ref_px); model cost/share = half spread + k at ref_px,
                      exactly as b_mvb.simulate_trade charges it (commission is a separate, known number).
-  live_selection.csv: day, ticker  (the names the live 09:35 selection picked on that day)
+  live_selection.csv: day, ticker  (the names the live 09:35 selection SIGNALLED on that day: top-N by RVOL minus
+                     dojis and side-filtered names, i.e. the names that got an order intent. The backtest's trades.csv
+                     has no rows for dojis, so listing them here would lower the overlap for no reason)
 The backtest's selection for the same days comes from the run's trades.csv (all signals, filled or not).
 """
 from __future__ import annotations

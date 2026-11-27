@@ -31,4 +31,10 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] u) Ticker reuse / identity breaks: `validate` lists likely reuse (unexplained open/prev-close jump ≥ 3×, or > 30 days without bars then > 50% level change) as WARN rows + `data/identity_warnings.csv` for a spot check
 - [x] v) Paper → live gate checker: realised slippage ≤ 1.5× the model; live/backtest top-20 overlap ≥ 80%; live expectancy inside the backtest's 95% CI (prereg "Paper → live gate"), offline, with tests
 - [x] w) Docs refresh: CLAUDE.md, plan §6–8, build log Round 5, test counts
-- [ ] x) Boss review #5 + full suite + verifier
+- [x] x) Boss review #5 + full suite + verifier
+- [x] y) pandas future-proofing: `fillna(False)` on float columns (Pandas4Warning in CI; would raise on a future pandas)
+
+## Next (for the next session)
+- [ ] z1) With keys: `python run_dev_a.py` → read the draft `docs/results-DEV-A.md` with Shirel
+- [ ] z2) A paper shadow logger that writes `paper_trades.csv` / `paper_fills.csv` / `live_selection.csv` in the formats `paper_gate_b.py` and `paper_vs_cone.py` read (no order code; needs the order-risk skill review first)
+- [ ] z3) Measure real-data runtime of DEV-A and of `--nulls-all-versions` on the holdout sizes

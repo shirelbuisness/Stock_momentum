@@ -500,8 +500,8 @@ def entry_trigger(r, side: int, k: Knobs) -> float:
 
 def _trades_df(rows: list[dict]) -> pd.DataFrame:
     out = pd.DataFrame(rows).reindex(columns=TRADE_COLS)
-    out["filled"] = out["filled"].fillna(False).astype(bool)
-    out["same_bar_stop"] = out["same_bar_stop"].fillna(False).astype(bool)
+    for c in ("filled", "same_bar_stop"):     # all-NaN columns are float: map NaN -> False without fillna(False)
+        out[c] = out[c].astype(object).where(out[c].notna(), False).astype(bool)
     return out
 
 
