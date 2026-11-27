@@ -9,6 +9,6 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] e) Speed profiling, with a test proving identical results
 - [x] f) Short side as a backtest-only shadow with SSR and easy-to-borrow flags
 - [x] g) GitHub Actions running all tests on push
-- [ ] h) Offline 09:35 selection dry run against fake_alpaca.py (order intents to a file, no broker code)
-- [ ] i) Optional Parquet storage with an identical-results test
-- [ ] j) If Alpaca keys exist and data.alpaca.markets is reachable: runbook through DEV-A + ticks → docs/results-DEV-A.md; otherwise log skipped
+- [x] h) Offline 09:35 selection dry run against fake_alpaca.py (order intents to a file, no broker code)
+- [x] i) Optional Parquet storage with an identical-results test
+- [x] j) SKIPPED (no keys; host blocked) — If Alpaca keys exist and data.alpaca.markets is reachable: runbook through DEV-A + ticks → docs/results-DEV-A.md; otherwise log skipped
