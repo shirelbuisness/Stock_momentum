@@ -8,7 +8,7 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] d) Monte Carlo expected cone per run
 - [x] e) Speed profiling, with a test proving identical results
 - [x] f) Short side as a backtest-only shadow with SSR and easy-to-borrow flags
-- [ ] g) GitHub Actions running all tests on push
+- [x] g) GitHub Actions running all tests on push
 - [ ] h) Offline 09:35 selection dry run against fake_alpaca.py (order intents to a file, no broker code)
 - [ ] i) Optional Parquet storage with an identical-results test
 - [ ] j) If Alpaca keys exist and data.alpaca.markets is reachable: runbook through DEV-A + ticks → docs/results-DEV-A.md; otherwise log skipped
