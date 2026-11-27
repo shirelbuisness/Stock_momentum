@@ -5,7 +5,7 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] a) DSR from experiments/trials.csv, random-skip null, Hansen SPA, PBO via CSCV — all in b_mvb.py's report, with tests
 - [x] b) NYSE early-closes calendar 2015–2023, with tests
 - [x] c) Breakeven slippage in bp + scratches reported separately
-- [ ] d) Monte Carlo expected cone per run
+- [x] d) Monte Carlo expected cone per run
 - [ ] e) Speed profiling, with a test proving identical results
 - [ ] f) Short side as a backtest-only shadow with SSR and easy-to-borrow flags
 - [ ] g) GitHub Actions running all tests on push

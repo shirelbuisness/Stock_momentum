@@ -933,6 +933,15 @@ def _main(argv=None):
     with open(os.path.join(outdir, "config.json"), "w") as f:
         json.dump(dict(args=vars(a), variants=[dict(id=v.id, knobs=asdict(v.knobs), note=v.note) for v in variants],
                        data_fingerprint=fp), f, indent=2)
+    import gate_stats as G
+    cones = {}
+    for i, v in enumerate(variants):
+        tr = results[idx[("var", v.id)]]
+        f = tr[tr["filled"]] if not tr.empty else tr
+        cones[v.id] = G.expected_cone(f["r_net"].to_numpy() if not f.empty else [], seed=a.seed + i)
+    with open(os.path.join(outdir, "expected_cone.json"), "w") as f:
+        json.dump(dict(run=stamp, data_fingerprint=fp, start=a.start, end=a.end, versions=cones), f, indent=2)
+    gate["cone_base"] = cones[variants[0].id]
     write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
@@ -1030,6 +1039,15 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
               f"- PBO via CSCV ({gate.get('pbo_blocks', 0)} blocks, {gate.get('pbo_splits', 0)} splits, all "
               f"{len(summ)} versions, daily net R Sharpe): **PBO = {fmt(gate.get('pbo'))}**. > 0.3 → the search is "
               "overfit."]
+    cone = gate.get("cone_base")
+    if cone and cone.get("horizons"):
+        L += ["", "## Expected cone for paper monitoring (baseline; all versions in expected_cone.json)", "",
+              f"{cone['method']}, {cone['paths']} paths, seed {cone['seed']}, from {cone['source_trades']} trades. "
+              "Net R after all costs. Below p5 or DD above p95 → check the implementation (signals, fills, costs) "
+              "before blaming the market; ABOVE p95 → also investigate.", "",
+              "| after N trades | cum R p5 | p50 | p95 | max DD R p5 | p50 | p95 |", "|---|---|---|---|---|---|---|"]
+        for h, x in cone["horizons"].items():
+            L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"]) + " |")
     L += ["", "## Reading rules", "- Not preregistered yet: treat t < 3 as 'not worth pursuing' (rigor skill §5).",
           "- A variant beats the base only with t_vs_base > 2 AND wins again on the next period's fresh data.",
           "- Breakeven ticks/side < 2 → B as specified does not get deployed (plan §4).",

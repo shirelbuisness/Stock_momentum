@@ -139,3 +139,36 @@ def test_spa_size_under_h0_is_close_to_nominal():
     ps = np.array([G.spa_test(np.random.default_rng(1000 + s).normal(0, 1, (300, 3)), reps=200, seed=s)["spa_p"]
                    for s in range(120)])
     assert (ps < 0.05).mean() <= 0.11
+
+
+# ------------------------------------------------------------------ expected cone
+def test_cone_constant_trades_is_exact():
+    c = G.expected_cone([0.5] * 10, horizons=(25, 100), paths=200, seed=1)
+    assert c["horizons"]["25"]["cum_R"] == pytest.approx([12.5] * 3)
+    assert c["horizons"]["100"]["max_dd_R"] == pytest.approx([0.0] * 3)
+
+
+def test_cone_known_shape_and_drawdown_definition():
+    # +1 / -1 coin: cum R after 100 trades ~ N(0, 10) -> p5 ~ -16.4, p95 ~ +16.4; DD >= 0 and grows with N
+    c = G.expected_cone([1.0, -1.0], paths=20000, seed=2)
+    lo, mid, hi = c["horizons"]["100"]["cum_R"]
+    assert lo == pytest.approx(-16.4, abs=1.0) and abs(mid) <= 1 and hi == pytest.approx(16.4, abs=1.0)
+    dds = [c["horizons"][h]["max_dd_R"][1] for h in ("25", "50", "100", "200")]
+    assert dds == sorted(dds) and dds[0] > 0
+    # drawdown counts from the start: a first trade of -1 is already a 1R drawdown
+    one = G.expected_cone([-1.0], horizons=(1,), paths=10, seed=0)
+    assert one["horizons"]["1"]["max_dd_R"] == pytest.approx([1.0] * 3)
+
+
+def test_cone_file_written_per_run(tmp_path):
+    import json
+    make_market(str(tmp_path), n_tickers=30, n_days=40, seed=22)
+    out = B.main(["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"),
+                  "--start", "2019-01-23", "--end", "2019-12-31", "--nulls", "0", "--gate-reps", "20",
+                  "--variants", _variants(tmp_path, [{"id": "b", "knobs": {"min_avg_vol": 0, "sides": "both"}}]),
+                  "--out", str(tmp_path / "runs"), "--trial-log", str(tmp_path / "t.csv")])
+    cone = json.load(open(os.path.join(out, "expected_cone.json")))
+    assert cone["versions"]["b"]["paths"] == 5000 and set(cone["versions"]["b"]["horizons"]) == {"25", "50", "100", "200"}
+    tr = pd.read_csv(os.path.join(out, "trades.csv"))
+    assert cone["versions"]["b"]["source_trades"] == int(tr["filled"].sum())
+    assert "Expected cone for paper monitoring" in open(os.path.join(out, "report.md")).read()

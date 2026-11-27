@@ -185,3 +185,31 @@ def pbo_cscv(perf: np.ndarray, n_blocks: int = 16) -> dict:
         lam.append(math.log(w / (1 - w)))
     lam = np.array(lam)
     return dict(pbo=float((lam <= 0).mean()), splits=len(lam), blocks=S, logit_median=float(np.median(lam)))
+
+
+# ----------------------------------------------------------------------------- expected cone (paper monitoring)
+CONE_HORIZONS = (25, 50, 100, 200)
+
+
+def expected_cone(r_net, horizons=CONE_HORIZONS, paths: int = 5000, seed: int = 0) -> dict:
+    """Monte Carlo cone for paper/live monitoring (rigor skill §8): resample the run's per-trade net R with
+    replacement (iid, seeded) into `paths` sequences; for each horizon (number of trades) give the 5th / 50th /
+    95th percentile of cumulative net R and of the max drawdown (in R, peak-to-trough, starting from 0).
+    Paper results below p5 (or drawdown above p95) -> check the implementation first; ABOVE p95 -> also check."""
+    r = np.asarray(r_net, dtype=float)
+    r = r[np.isfinite(r)]
+    out = dict(method="iid bootstrap of per-trade net R", paths=paths, seed=seed, source_trades=int(len(r)),
+               source_mean_R=float(r.mean()) if len(r) else float("nan"), horizons={})
+    if len(r) == 0:
+        return out
+    H = max(horizons)
+    rng = np.random.default_rng(seed)
+    draws = r[rng.integers(0, len(r), (paths, H))]
+    cum = np.cumsum(draws, axis=1)
+    peak = np.maximum.accumulate(np.concatenate([np.zeros((paths, 1)), cum], axis=1), axis=1)[:, 1:]
+    dd = np.maximum.accumulate(peak - cum, axis=1)
+    for h in horizons:
+        c, d = cum[:, h - 1], dd[:, h - 1]
+        out["horizons"][str(h)] = dict(cum_R=[float(np.percentile(c, q)) for q in (5, 50, 95)],
+                                       max_dd_R=[float(np.percentile(d, q)) for q in (5, 50, 95)])
+    return out
