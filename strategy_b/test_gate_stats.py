@@ -168,7 +168,21 @@ def test_cone_file_written_per_run(tmp_path):
                   "--variants", _variants(tmp_path, [{"id": "b", "knobs": {"min_avg_vol": 0, "sides": "both"}}]),
                   "--out", str(tmp_path / "runs"), "--trial-log", str(tmp_path / "t.csv")])
     cone = json.load(open(os.path.join(out, "expected_cone.json")))
-    assert cone["versions"]["b"]["paths"] == 5000 and set(cone["versions"]["b"]["horizons"]) == {"25", "50", "100", "200"}
+    c = cone["versions"]["b"]
+    assert c["iid"]["paths"] == 5000 and set(c["day_block"]["horizons"]) == {"25", "50", "100", "200"}
     tr = pd.read_csv(os.path.join(out, "trades.csv"))
-    assert cone["versions"]["b"]["source_trades"] == int(tr["filled"].sum())
+    tr = tr[tr["variant"] == "b"]
+    assert c["iid"]["source_trades"] == c["day_block"]["source_trades"] == int(tr["filled"].sum())
+    assert c["day_block"]["source_days"] == tr.loc[tr["filled"], "day"].nunique()
     assert "Expected cone for paper monitoring" in open(os.path.join(out, "report.md")).read()
+
+
+def test_day_block_cone_is_wider_when_same_day_trades_move_together():
+    rng = np.random.default_rng(9)
+    days = np.repeat(np.arange(300), 5)
+    r = np.repeat(rng.choice([1.0, -1.0], 300), 5) + rng.normal(0, 0.1, 1500)   # 5 trades/day, same sign
+    iid = G.expected_cone(r, paths=3000, seed=1)["horizons"]["100"]["cum_R"]
+    blk = G.expected_cone(r, paths=3000, seed=1, days=days)["horizons"]["100"]["cum_R"]
+    assert (blk[2] - blk[0]) > 1.8 * (iid[2] - iid[0])                          # ~sqrt(5) wider
+    one = G.expected_cone([1.0, 2.0, 3.0], horizons=(3,), paths=50, seed=0, days=[0, 0, 0])
+    assert one["horizons"]["3"]["cum_R"] == pytest.approx([6.0] * 3)            # one day = one block, kept whole

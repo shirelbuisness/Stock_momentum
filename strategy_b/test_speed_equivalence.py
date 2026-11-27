@@ -59,9 +59,12 @@ def _same(out_a, out_b):
     pd.testing.assert_frame_equal(ta, tb, check_exact=False, rtol=1e-12, atol=1e-12)
     sa, sb = pd.read_csv(f"{out_a}/summary.csv"), pd.read_csv(f"{out_b}/summary.csv")
     pd.testing.assert_frame_equal(sa, sb, check_exact=False, rtol=1e-12, atol=1e-12)
-    assert open(f"{out_a}/report.md").read() == open(f"{out_b}/report.md").read()
+    ra, rb = open(f"{out_a}/report.md").read(), open(f"{out_b}/report.md").read()
+    cut = "## Expected cone"                              # cone section changed after the freeze (task m)
+    assert ra.split(cut)[0] == rb.split(cut)[0] and ra.split(cut)[1].split("## ", 1)[1] == rb.split(cut)[1].split("## ", 1)[1]
     ca, cb = json.load(open(f"{out_a}/expected_cone.json")), json.load(open(f"{out_b}/expected_cone.json"))
-    assert ca["versions"] == cb["versions"]
+    # the day-block cone was added after the freeze (task m); the iid cone must be unchanged
+    assert {k: v["iid"] for k, v in ca["versions"].items()} == cb["versions"]
     return ta
 
 

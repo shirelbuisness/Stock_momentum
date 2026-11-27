@@ -1069,10 +1069,15 @@ def _main(argv=None):
     for i, v in enumerate(variants):
         tr = results[idx[("var", v.id)]]
         f = tr[tr["filled"]] if not tr.empty else tr
-        cones[v.id] = G.expected_cone(f["r_net"].to_numpy() if not f.empty else [], seed=a.seed + i)
+        fo = f.sort_values(["day", "entry_t"]) if not f.empty else f
+        cones[v.id] = dict(
+            day_block=G.expected_cone(fo["r_net"].to_numpy() if not fo.empty else [], seed=a.seed + i,
+                                      days=fo["day"].to_numpy() if not fo.empty else []),
+            iid=G.expected_cone(f["r_net"].to_numpy() if not f.empty else [], seed=a.seed + i))
     with open(os.path.join(outdir, "expected_cone.json"), "w") as f:
         json.dump(dict(run=stamp, data_fingerprint=fp, start=a.start, end=a.end, versions=cones), f, indent=2)
-    gate["cone_base"] = cones[variants[0].id]
+    gate["cone_base"] = cones[variants[0].id]["day_block"]
+    gate["cone_base_iid"] = cones[variants[0].id]["iid"]
     gate["shadow"] = shadow
     with open(os.path.join(outdir, "gate.json"), "w") as f:          # run-level gate numbers for gate_b.py
         json.dump({k_: gate.get(k_) for k_ in ("n_trials", "var_sr", "sr0_day", "spa_p", "spa_best", "pbo",
@@ -1176,13 +1181,17 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
               "overfit."]
     cone = gate.get("cone_base")
     if cone and cone.get("horizons"):
+        iid = gate.get("cone_base_iid", {}).get("horizons", {})
         L += ["", "## Expected cone for paper monitoring (baseline; all versions in expected_cone.json)", "",
               f"{cone['method']}, {cone['paths']} paths, seed {cone['seed']}, from {cone['source_trades']} trades. "
               "Net R after all costs. Below p5 or DD above p95 → check the implementation (signals, fills, costs) "
               "before blaming the market; ABOVE p95 → also investigate.", "",
-              "| after N trades | cum R p5 | p50 | p95 | max DD R p5 | p50 | p95 |", "|---|---|---|---|---|---|---|"]
+              "Primary = day-block (same-day trades move together); the iid cone is shown for comparison.", "",
+              "| after N trades | cum R p5 | p50 | p95 | max DD R p5 | p50 | p95 | iid cum R p5 | iid p95 |",
+              "|---|---|---|---|---|---|---|---|---|"]
         for h, x in cone["horizons"].items():
-            L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"]) + " |")
+            y = iid.get(h, {}).get("cum_R", [np.nan] * 3)
+            L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"] + [y[0], y[2]]) + " |")
     sh = gate.get("shadow")
     if sh:
         L += ["", "## Short shadow (backtest only; never a verdict, never traded)", "",

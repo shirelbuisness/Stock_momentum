@@ -191,20 +191,54 @@ def pbo_cscv(perf: np.ndarray, n_blocks: int = 16) -> dict:
 CONE_HORIZONS = (25, 50, 100, 200)
 
 
-def expected_cone(r_net, horizons=CONE_HORIZONS, paths: int = 5000, seed: int = 0) -> dict:
+def expected_cone(r_net, horizons=CONE_HORIZONS, paths: int = 5000, seed: int = 0, days=None) -> dict:
     """Monte Carlo cone for paper/live monitoring (rigor skill §8): resample the run's per-trade net R with
     replacement (iid, seeded) into `paths` sequences; for each horizon (number of trades) give the 5th / 50th /
     95th percentile of cumulative net R and of the max drawdown (in R, peak-to-trough, starting from 0).
-    Paper results below p5 (or drawdown above p95) -> check the implementation first; ABOVE p95 -> also check."""
+    Paper results below p5 (or drawdown above p95) -> check the implementation first; ABOVE p95 -> also check.
+
+    days given (one label per trade, trades in time order): DAY-BLOCK bootstrap instead. Whole days are drawn with
+    replacement and their trades kept together, so same-day correlation (one market move hits all 20 names) stays
+    in the cone. Usually wider than iid, and the honest one for paper monitoring."""
     r = np.asarray(r_net, dtype=float)
     r = r[np.isfinite(r)]
-    out = dict(method="iid bootstrap of per-trade net R", paths=paths, seed=seed, source_trades=int(len(r)),
+    r_all = np.asarray(r_net, dtype=float)
+    keep = np.isfinite(r_all)
+    method = "iid bootstrap of per-trade net R" if days is None else "day-block bootstrap of per-trade net R"
+    out = dict(method=method, paths=paths, seed=seed, source_trades=int(len(r)),
                source_mean_R=float(r.mean()) if len(r) else float("nan"), horizons={})
     if len(r) == 0:
         return out
     H = max(horizons)
     rng = np.random.default_rng(seed)
-    draws = r[rng.integers(0, len(r), (paths, H))]
+    if days is None:
+        draws = r[rng.integers(0, len(r), (paths, H))]
+    else:
+        dl = np.asarray(days)[keep]
+        _, first, inv = np.unique(dl, return_index=True, return_inverse=True)
+        out["source_days"] = len(first)
+        order = np.argsort(inv, kind="stable")              # trades grouped by day, time order kept
+        rs = r[order]
+        L = np.bincount(inv)
+        start = np.concatenate([[0], np.cumsum(L)[:-1]])
+        n_draw = int(np.ceil(H / max(1.0, L.mean()) * 3)) + 5   # enough days to pass H trades almost surely
+        D = rng.integers(0, len(L), (paths, n_draw))
+        reps = L[D].ravel()
+        tot = L[D].sum(axis=1)
+        flat = np.repeat(start[D].ravel(), reps)
+        excl = np.cumsum(reps) - reps
+        flat = flat + (np.arange(reps.sum()) - np.repeat(excl, reps))
+        path_of = np.repeat(np.repeat(np.arange(paths), n_draw), reps)
+        pos = np.arange(len(flat)) - np.repeat(np.concatenate([[0], np.cumsum(tot)[:-1]]), tot)
+        keep_ = pos < H
+        draws = np.full((paths, H), np.nan)
+        draws[path_of[keep_], pos[keep_]] = rs[flat[keep_]]
+        for p in np.nonzero(tot < H)[0]:                    # rare: top up short paths day by day
+            seq = rs[flat[path_of == p]]
+            while len(seq) < H:
+                i = rng.integers(0, len(L))
+                seq = np.concatenate([seq, rs[start[i]:start[i] + L[i]]])
+            draws[p] = seq[:H]
     cum = np.cumsum(draws, axis=1)
     peak = np.maximum.accumulate(np.concatenate([np.zeros((paths, 1)), cum], axis=1), axis=1)[:, 1:]
     dd = np.maximum.accumulate(peak - cum, axis=1)
