@@ -102,3 +102,92 @@ def test_end_to_end_on_real_b_mvb_outputs(tmp_path):
     res = GB.main(["confirm", "--dev-a", a, "--dev-b", b])
     assert res["step"] == "confirm" and any("not inside DEV-B" in n for n in res["notes"])
     assert os.path.exists(os.path.join(b, "gate_confirm.md"))
+
+
+# ----------------------------------------------------------------------------- holdout pass gate (task q)
+GOOD = dict(trades=1500, mean_R_net=0.10, t_net=3.0, sharpe_1x=1.5, dsr=0.97, mean_R_net_2x_slip=0.04,
+            max_dd_1x=0.12, quarters_pos="7/8", pct_pos_months=0.7, mean_R_net_ex_top5_tickers=0.06,
+            breakeven_ticks=2.5, profit_factor=1.5)
+
+
+def mk_holdout(tmp, rows, nulls, name="h", start="2024-01-01", end="2025-12-31", open_holdout=True):
+    d = tmp / name
+    d.mkdir()
+    json.dump(dict(args=dict(start=start, end=end, ticks="t.csv", open_holdout=open_holdout),
+                   variants=[{"id": r["id"], "knobs": BASE} for r in rows]), open(d / "config.json", "w"))
+    pd.DataFrame(rows).to_csv(d / "summary.csv", index=False)
+    json.dump(dict(spa_p=0.01, nulls=nulls), open(d / "gate.json", "w"))
+    return str(d)
+
+
+def _nulls(vids, p95=0.0):
+    return [dict(null=m, version=v, null_p95=p95) for v in vids for m in ("random_entry", "random_names")]
+
+
+def test_holdout_all_items_pass_and_each_item_can_fail(tmp_path):
+    h = GB.holdout(GB.load_run(mk_holdout(tmp_path, [dict(id="base", **GOOD)], _nulls(["base"])), holdout_ok=True),
+                   0.08, 2)
+    assert h["passed"] == ["base"] and h["rows"][0]["label"] == "ALIVE" and not h["rehearsal"]
+    breaks = {"mean_R_net": 0.07, "t_net": 1.9, "sharpe_1x": 0.9, "dsr": 0.94, "mean_R_net_2x_slip": 0.0,
+              "max_dd_1x": 0.25, "trades": 999, "quarters_pos": "5/8", "pct_pos_months": 0.59,
+              "mean_R_net_ex_top5_tickers": -0.01, "breakeven_ticks": 1.9}
+    item = {"mean_R_net": "1.", "t_net": "1.", "sharpe_1x": "2.", "dsr": "4.", "mean_R_net_2x_slip": "5a.",
+            "max_dd_1x": "5b.", "trades": "6a.", "quarters_pos": "6b.", "pct_pos_months": "6c.",
+            "mean_R_net_ex_top5_tickers": "6d.", "breakeven_ticks": "7."}
+    for i, (k, v) in enumerate(breaks.items()):
+        run = mk_holdout(tmp_path, [dict(id="base", **{**GOOD, k: v})], _nulls(["base"]), name=f"b{i}")
+        r = GB.holdout(GB.load_run(run, holdout_ok=True), 0.08, 2)["rows"][0]
+        failed = [c for c, ok in r["checks"].items() if not ok]
+        assert len(failed) == 1 and failed[0].startswith(item[k]), (k, failed)
+
+
+def test_holdout_bars_matter_nulls_and_holm(tmp_path):
+    rows = [dict(id="base", **{**GOOD, "mean_R_net": 0.06}), dict(id="v1", **GOOD, p_holm=0.04),
+            dict(id="v2", **GOOD, p_holm=0.06)]
+    run = mk_holdout(tmp_path, rows, _nulls(["base", "v1"]))
+    h = GB.holdout(GB.load_run(run, holdout_ok=True), 0.05, 1)
+    assert h["passed"] == ["base", "v1"]                      # v2: Holm p 0.06 and no nulls of its own
+    v2 = [c for c, ok in h["rows"][2]["checks"].items() if not ok]
+    assert any("MISSING" in c for c in v2) and any("Holm" in c for c in v2)
+    assert GB.holdout(GB.load_run(run, holdout_ok=True), 0.08, 1)["passed"] == ["v1"]   # base 0.06 < 0.08
+    run2 = mk_holdout(tmp_path, [dict(id="base", **GOOD)], _nulls(["base"], p95=0.11), name="n")
+    assert GB.holdout(GB.load_run(run2, holdout_ok=True), 0.05, 1)["passed"] == []      # does not beat the null
+
+
+def test_holdout_fragile_label_and_healthy_shape(tmp_path):
+    run = mk_holdout(tmp_path, [dict(id="base", **{**GOOD, "mean_R_net_2x_slip": -0.01, "profit_factor": 3.1,
+                                                    "pct_pos_months": 1.0})], _nulls(["base"]))
+    r = GB.holdout(GB.load_run(run, holdout_ok=True), 0.05, 1)["rows"][0]
+    assert r["label"].startswith("FRAGILE") and len(r["shape"]) == 2 and "bug" in r["shape"][0]
+
+
+def test_holdout_cli_requires_the_open_choices_and_a_real_holdout(tmp_path):
+    run = mk_holdout(tmp_path, [dict(id="base", **GOOD)], _nulls(["base"]))
+    with pytest.raises(SystemExit):
+        GB.main(["holdout", "--run", run, "--net-r-bar", "0.05"])
+    with pytest.raises(SystemExit):
+        GB.main(["holdout", "--run", run, "--net-r-bar", "0.06", "--breakeven-ticks-bar", "2"])   # not a choice
+    dev = mk_holdout(tmp_path, [dict(id="base", **GOOD)], _nulls(["base"]), name="dev", start="2021-01-01",
+                     end="2023-12-31", open_holdout=False)
+    with pytest.raises(SystemExit, match="not a holdout run"):
+        GB.main(["holdout", "--run", dev, "--net-r-bar", "0.05", "--breakeven-ticks-bar", "2"])
+    res = GB.main(["holdout", "--run", dev, "--net-r-bar", "0.05", "--breakeven-ticks-bar", "2", "--rehearse"])
+    assert res["rehearsal"] and "REHEARSAL" in open(os.path.join(dev, "gate_holdout.md")).read()
+
+
+def test_holdout_rehearsal_end_to_end_on_b_mvb_output(tmp_path):
+    make_market(str(tmp_path), n_tickers=30, n_days=40, seed=71, momentum=0.1)
+    v = tmp_path / "v.json"
+    v.write_text(json.dumps([{"id": "b", "knobs": {"min_avg_vol": 0}}, {"id": "f3", "knobs": {"min_avg_vol": 0, "top_n": 3}}]))
+    out = B.main(["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"),
+                  "--start", "2019-01-23", "--end", "2019-12-31", "--nulls", "2", "--nulls-all-versions",
+                  "--stress", "--breakeven", "--gate-reps", "20", "--variants", str(v),
+                  "--out", str(tmp_path / "r"), "--trial-log", str(tmp_path / "t.csv")])
+    g = json.load(open(os.path.join(out, "gate.json")))
+    assert {(n["version"], n["null"]) for n in g["nulls"]} == {(x, m) for x in ("b", "f3")
+                                                                for m in ("random_entry", "random_names")}
+    assert "| version | null |" in open(os.path.join(out, "report.md")).read()
+    res = GB.main(["holdout", "--run", out, "--net-r-bar", "0.05", "--breakeven-ticks-bar", "2", "--rehearse"])
+    assert [r["id"] for r in res["rows"]] == ["b", "f3"]
+    assert not any("MISSING" in c for r in res["rows"] for c in r["checks"])   # every item had its number
+    assert all(not ok for r in res["rows"] for c, ok in r["checks"].items() if c.startswith("6a."))   # < 1000 trades

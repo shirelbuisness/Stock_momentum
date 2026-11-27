@@ -903,6 +903,9 @@ def _main(argv=None):
     ap.add_argument("--end", default="2023-12-31")
     ap.add_argument("--open-holdout", action="store_true", help="allow dates >= 2024-01-01 (ONE run, logged)")
     ap.add_argument("--nulls", type=int, default=20, help="null repetitions per null type (baseline only)")
+    ap.add_argument("--nulls-all-versions", action="store_true",
+                    help="run the nulls for EVERY version, not only the base (holdout pass gate item 3 needs them "
+                         "for each promoted version; runtime grows with the number of versions)")
     ap.add_argument("--breakeven", action="store_true", help="compute breakeven slippage for every variant (5x runtime)")
     ap.add_argument("--stress", action="store_true", help="also run every variant at 2x slippage")
     ap.add_argument("--out", default="runs")
@@ -1026,6 +1029,8 @@ def _main(argv=None):
     for mode in (["random_entry", "random_names"] if a.nulls > 0 else []):
         for rep in range(a.nulls):
             add(("null", mode, rep), (variants[0], mode, a.seed + 1000 * rep))
+            for v in (variants[1:] if a.nulls_all_versions else []):
+                add(("null", mode, rep, v.id), (v, mode, a.seed + 1000 * rep))
     print(f"running {len(specs)} specs over {len(trade_files)} days (each day file read once)", flush=True)
     diag: dict = {"calendar": CAL_STATE["source"], "holiday_files": sorted(set(trade_files) & holiday_days),
                   "early_closes_in_range": sorted(d for d in EARLY_CLOSES if d in trade_files)}
@@ -1078,17 +1083,18 @@ def _main(argv=None):
 
     null_rows = []
     if a.nulls > 0:
-        for mode in ["random_entry", "random_names"]:
-            means = []
-            for rep in range(a.nulls):
-                ntr = results[idx[("null", mode, rep)]]
-                f = ntr[ntr["filled"]]
-                means.append(f["r_net"].mean() if not f.empty else np.nan)
-            means = np.array(means, dtype=float)
-            real = rows[0].get("mean_R_net", np.nan)
-            null_rows.append(dict(null=mode, reps=a.nulls, null_mean=np.nanmean(means),
-                                  null_p95=np.nanpercentile(means, 95), real=real,
-                                  share_null_ge_real=float(np.nanmean(means >= real))))
+        for vi, v in enumerate(variants if a.nulls_all_versions else variants[:1]):
+            for mode in ["random_entry", "random_names"]:
+                means = []
+                for rep in range(a.nulls):
+                    ntr = results[idx[("null", mode, rep) if vi == 0 else ("null", mode, rep, v.id)]]
+                    f = ntr[ntr["filled"]]
+                    means.append(f["r_net"].mean() if not f.empty else np.nan)
+                means = np.array(means, dtype=float)
+                real = rows[vi].get("mean_R_net", np.nan)
+                null_rows.append(dict(null=mode, reps=a.nulls, null_mean=np.nanmean(means),
+                                      null_p95=np.nanpercentile(means, 95), real=real,
+                                      share_null_ge_real=float(np.nanmean(means >= real)), version=v.id))
 
     summ = pd.DataFrame(rows)
     if "p_vs_base" in summ:
@@ -1117,7 +1123,7 @@ def _main(argv=None):
     gate["shadow"] = shadow
     with open(os.path.join(outdir, "gate.json"), "w") as f:          # run-level gate numbers for gate_b.py
         json.dump({k_: gate.get(k_) for k_ in ("n_trials", "var_sr", "sr0_day", "spa_p", "spa_best", "pbo",
-                                                "pbo_splits", "pbo_blocks", "beta")} | {"replication": (
+                                                "pbo_splits", "pbo_blocks", "beta")} | {"nulls": null_rows, "replication": (
             {k_: repl.get(k_) for k_ in ("trades", "sharpe_1x", "mean_R_net", "pass")} if repl else None)},
                   f, indent=2, default=float)
     write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
@@ -1191,8 +1197,13 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
     if null_rows:
         L += ["", "## Nulls (baseline)", "", "| null | reps | null mean R | null p95 | real | share of nulls ≥ real |",
               "|---|---|---|---|---|---|"]
+        many = len({n["version"] for n in null_rows}) > 1
+        if many:
+            L[-2], L[-1] = L[-2].replace("| null |", "| version | null |"), L[-1] + "---|"
+            L[-4] = "## Nulls (every version: same rules, random entry minute / random eligible names)"
         for n in null_rows:
-            L.append(f"| {n['null']} | {n['reps']} | {fmt(n['null_mean'])} | {fmt(n['null_p95'])} | {fmt(n['real'])} | "
+            L.append(("| " + n["version"] + " " if many else "")
+                     + f"| {n['null']} | {n['reps']} | {fmt(n['null_mean'])} | {fmt(n['null_p95'])} | {fmt(n['real'])} | "
                      f"{fmt(n['share_null_ge_real'], 2)} |")
     if base_tr is not None and not base_tr.empty and base_tr["filled"].any():
         f = base_tr[base_tr["filled"]].copy()
