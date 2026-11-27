@@ -1,0 +1,19 @@
+[
+  {"id": "B-v1__base", "knobs": {}, "note": "B0-primary: paper rules, long-only, 1x, full costs"},
+
+  {"id": "B-v1__stop_atr=0.25", "knobs": {"stop_atr": 0.25}, "note": "L1 wider stop: cost per R ~2.5x lower (exit expert #1)"},
+  {"id": "B-v1__stop_atr=0.50", "knobs": {"stop_atr": 0.50}, "note": "L2 wide stop"},
+  {"id": "B-v1__stop_mode=or_opposite", "knobs": {"stop_mode": "or_opposite"}, "note": "L3 stop at OR low, floor max(10% ATR, 2x cost), cap 50% ATR"},
+  {"id": "B-v1__time_stop=10:30", "knobs": {"time_stop": "10:30", "time_stop_r": 0.5}, "note": "L4 exit stalled trades: 10:30 close < +0.5R -> out"},
+  {"id": "B-v1__entry_cutoff=10:30", "knobs": {"entry_cutoff": "10:30"}, "note": "L5 no entries after 10:30"},
+
+  {"id": "B-v1__min_stop_cost_mult=5", "knobs": {"min_stop_cost_mult": 5.0}, "note": "F1 skip if stop < 5x round-trip cost (practitioner #1)"},
+  {"id": "B-v1__rvol_min=2.0", "knobs": {"rvol_min": 2.0}, "note": "F2 stronger 'in play' (paper: edge rises with RVOL)"},
+  {"id": "B-v1__top_n=10", "knobs": {"top_n": 10}, "note": "F3 only the 10 highest RVOL"},
+  {"id": "B-v1__max_or_range_atr=0.6", "knobs": {"max_or_range_atr": 0.6}, "note": "F4 skip exhausted first bars (lore)"},
+  {"id": "B-v1__close_loc_min=0.7", "knobs": {"close_loc_min": 0.7}, "note": "F5 first bar closes in its top 30% (lore)"},
+  {"id": "B-v1__entry_bar2=true", "knobs": {"entry_bar2": true}, "note": "F6 trigger at 2nd 5-min bar high (fewer fake breakouts)"},
+  {"id": "B-v1__min_price=10", "knobs": {"min_price": 10.0}, "note": "F7 tradability: fewer ticks per R"},
+  {"id": "B-v1__spy_filter=true", "knobs": {"spy_filter": true}, "note": "F8 regime: longs only if SPY prior close -> 09:35 is up"},
+  {"id": "B-v1__or_minutes=15", "knobs": {"or_minutes": 15}, "note": "F9 15-min opening range (paper's next best)"}
+]
