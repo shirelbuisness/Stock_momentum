@@ -29,6 +29,6 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 
 ## Refill 19:40 UTC, session 2
 - [x] u) Ticker reuse / identity breaks: `validate` lists likely reuse (unexplained open/prev-close jump ≥ 3×, or > 30 days without bars then > 50% level change) as WARN rows + `data/identity_warnings.csv` for a spot check
-- [ ] v) Paper → live gate checker: realised slippage ≤ 1.5× the model; live/backtest top-20 overlap ≥ 80%; live expectancy inside the backtest's 95% CI (prereg "Paper → live gate"), offline, with tests
+- [x] v) Paper → live gate checker: realised slippage ≤ 1.5× the model; live/backtest top-20 overlap ≥ 80%; live expectancy inside the backtest's 95% CI (prereg "Paper → live gate"), offline, with tests
 - [ ] w) Docs refresh: CLAUDE.md, plan §6–8, build log Round 5, test counts
 - [ ] x) Boss review #5 + full suite + verifier
