@@ -75,6 +75,11 @@ python spread_b.py --run runs/<DEV-A run> --quotes data/quotes_spread.csv       
 - Changes nothing by itself: which statistic becomes "the measured value" is a team decision in the prereg; the rerun is a new trial.
 
 ## 5. Shortlist, confirm, pass gate (mechanical)
+DEV-B in one command, after the prereg is signed (base + the mechanical shortlist; `--all-versions` for PBO on DEV-B):
+```
+python run_dev_b.py --dev-a runs/<DEV-A tick-resolved run> --prereg-signed     # -> docs/results-DEV-B.md
+```
+Step by step instead:
 ```
 python gate_b.py shortlist --dev-a runs/<DEV-A tick-resolved run>
 python gate_b.py confirm   --dev-a runs/<DEV-A run> --dev-b runs/<DEV-B run with --stress>

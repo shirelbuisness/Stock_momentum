@@ -1,5 +1,5 @@
 # Strategy B: final plan v3, loss-reduction track + version testing (27.11.2026, status updated 27.11 evening)
-Builds on `strategy-B-build-plan.md` (rev 2: rules, data path, fill model, risk) and replaces its variant list and testing protocol. Panel for v3: exit/trade-management expert, statistician, ORB practitioner, regime/portfolio researcher. Code: `strategy_b/b_mvb.py` + `strategy_b/fetch_b_data.py` (156 tests pass).
+Builds on `strategy-B-build-plan.md` (rev 2: rules, data path, fill model, risk) and replaces its variant list and testing protocol. Panel for v3: exit/trade-management expert, statistician, ORB practitioner, regime/portfolio researcher. Code: `strategy_b/b_mvb.py` + `strategy_b/fetch_b_data.py` (161 tests pass).
 
 ## 1. Goal, stated honestly
 - **Goal:** profitable after ALL costs, with few losing *months*, not zero losing *trades*.
@@ -57,7 +57,7 @@ Builds on `strategy-B-build-plan.md` (rev 2: rules, data path, fill model, risk)
 ## 6. How to run
 Exact commands, time and disk estimates: `strategy-B-data-runbook.md`. In short:
 ```
-python -m pytest -q                                   # 156 tests must pass first
+python -m pytest -q                                   # 161 tests must pass first
 python fetch_b_data.py probe                          # GO / NO-GO
 python fetch_b_data.py assets | daily | opening | fullday | validate
 python b_mvb.py --daily data/daily.csv --minutes data/minutes --variants variants_b.json \
@@ -68,7 +68,7 @@ python b_mvb.py ...same... --ticks data/ticks.csv
 - **Output:** `runs/<stamp>_B/report.md` + `summary.csv` + `trades.csv` + `config.json`, and one row per variant in `experiments/trials.csv`.
 
 ## 7. Status of the code (verified with synthetic data + a fake Alpaca only)
-- **156 tests pass** (42 before the night of 27.11; the night's additions are in `night-log-2026-11-27.md`):
+- **161 tests pass** (42 before the night of 27.11; the night's additions are in `night-log-2026-11-27.md`):
   - known-answer fills (gap, same-bar stop, 1-tick-through trigger, short mirror, breakeven next-bar only, time stop, cost filter, OR stop cap, OHLC-path same-bar);
   - point-in-time features (split-scaled ATR, RVOL by sessions, RVOL future-perturbation);
   - guards (holdout once, ≤ 2 variants on the holdout, data gaps skipped, half days);
@@ -83,6 +83,7 @@ python b_mvb.py ...same... --ticks data/ticks.csv
 - **Built 27.11 night (synthetic-tested only):** DSR (N from the trial log), random-skip null, Hansen SPA, PBO via CSCV, day-block cone, `gate_b.py`. SPA is slightly liberal: with 14 versions, 7.6–9.6% rejections at 5% for n = 300 days and **5.9–6.3% at 5% (11% at 10%) for n = 1,250 (DEV-A length)** (`sim_spa_size.py`).
 - **Built 27.11 night, session 2:** market beta of the base vs SPY + F8 red-day diagnostic (§5, in every report), B0-replication sanity gate (`--replication`), `gate_b.py holdout` (whole pass gate), `run_dev_a.py`, ticker-reuse warnings in `validate`, `paper_gate_b.py` (paper → live gate).
 - **Built 27.11 night, session 3:** paper shadow logger without orders (`shadow_day_b.py`, = backtest trades exactly; IEX-aware ranking), SIP-quote spread calibration (`fetch_b_data.py quotes` + `spread_b.py`), paper → live gate rehearsed end to end on synthetic sessions.
+- **Built 28.11 night, session 4:** paper order path design (`paper-order-path-B-design.md`, to sign), `run_dev_b.py`, downloader fix (daily history and splits kept across calls).
 - **Known approximations:** gross R with a partial exit is approximate (partial is unused in v3); the half spread is an assumed 3 bp until calibrated with SIP quotes.
 
 ## 8. Next steps, in order

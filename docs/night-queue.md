@@ -54,4 +54,11 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 ## Refill 03:20 UTC, session 4 (z1, z3, ad still need keys; ae done)
 - [x] af) `run_dev_b.py`: DEV-B in one command after signing (all 15 versions on 2021–2023 with --stress/--replication, ticks, tick rerun, `gate_b.py confirm`, draft `docs/results-DEV-B.md`); refuses without a DEV-A run + its shortlist, refuses 2024+; rehearsed against fake_alpaca
 - [x] ag) Small fixes found while reading: dry_run_b docstring "15:59 close" wording (= close of the 15:58 bar)
-- [ ] ah) Boss review #7 (diff, verifier 100%, one number by hand) + docs refresh
+- [x] ah) Boss review #7 (diff, verifier 100%, one number by hand) + docs refresh
+
+## Next (for the next session)
+- [ ] z1) With keys: `python run_dev_a.py` → read the draft `docs/results-DEV-A.md` with Shirel; then `fetch_b_data.py quotes` + `spread_b.py`
+- [ ] ad) With keys: IEX vs SIP top-N overlap on ~60 DEV days (Decision 12)
+- [ ] z3) Measure real-data runtime of DEV-A and of `--nulls-all-versions`
+- [ ] ai) After signing: `python run_dev_b.py --dev-a <run> --prereg-signed`
+- [ ] aj) If the team picks per-leg exit costs (Decision 14): change `simulate_trade` AND the verifier independently, before any real run

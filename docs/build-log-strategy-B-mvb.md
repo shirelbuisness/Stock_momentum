@@ -5,7 +5,7 @@
 - **Finding (IEX):** the free plan's 09:35 view is IEX. IEX volume ÷ a SIP baseline → RVOL ≈ IEX share → the RVOL ≥ 100% filter selects nothing. Fixed in the logger (IEX baseline); a live engine needs the same. Day-to-day IEX-share noise (σ 0.5, synthetic) gave 79% overlap, under the paper→live gate's 80%.
 - `fetch_b_data.py quotes` + `spread_b.py`: half-spread calibration from SIP NBBO at the model's trade moments (close exits measured at the END of the 15:58 bar).
 - **Boss findings fixed:** `model_refs.csv` first used trades.csv prices, which already include half spread + k → the paper slippage check would have been lenient by the whole model cost; the IEX baseline cache was shared across OR lengths (F9 would have read 10-minute bars as its 15-minute baseline).
-- **156 tests** (155 + Parquet). Still never run on real data.
+- **161 tests** (160 + Parquet). Still never run on real data.
 
 ## Round 5: night session 2 (27.11.2026, evening). Details: `night-log-2026-11-27.md`
 - Market exposure of the base vs SPY + F8 red-signal-day diagnostic (plan v3 §5); B0-replication sanity gate (`--replication`); mean net R without the top-5 tickers.
@@ -87,6 +87,11 @@
 | R7 | The data fingerprint covered file names only | Low | Hash over size + mtime of every file |
 | R8 | The report mixed sizings without saying so | Low | The header now states it: mean R = equal $ risk; Sharpe/DD 1× = equal notional |
 
+### Round 7 (night 28.11, session 4): boss review
+- **Fixed (data, would have hit real data):** `fetch_b_data.py daily` rebuilt `daily.csv` from the years of the CURRENT call only and overwrote `splits.csv` with the current range's splits. A second call (e.g. `daily --start 2021-01-01` later) silently dropped 2015–2020 history and every earlier split factor (wrong ATR/RVOL, wrong split scaling). A year fetched in part was also marked done for good. Now: manifest pieces name the range fetched (`2019:2019-01-01_2019-01-31`), a wider request re-fetches the year's whole span, `daily.csv` is assembled from every part, `splits.csv` is the de-duplicated union of `splits_parts/`. Test: two calls in one year, an overlapping call (split counted once), a narrower call downloads nothing. Found because the DEV-B rehearsal's synthetic DEV-A run had 0 trades.
+- **Found, NOT changed (Decision 14):** the per-side cost (half spread + k) is computed once at the trigger price and charged on both legs. The exit leg should strictly be charged at the exit price. On a synthetic run the per-leg cost changes mean net R by −0.002 R (base) / −0.001 R (L2), max −0.026 R on a big winner: small, but optimistic on exactly the trades that pay. The independent verifier makes the same choice, so it cannot catch it.
+- `run_dev_b.py`: refuses if the frozen file's knobs differ from the DEV-A run's; `gate_b.confirm` labels PBO from a subset run instead of judging the whole search on it.
+
 ### Open, not fixed in code
 - **ETFs/ADRs:** the downloader's name heuristic is the only filter.
 - ~~Breakeven slippage is in ticks only~~ → bp added in Round 4.
@@ -95,4 +100,5 @@
 - ~~Gate tools not built~~ → built in Round 4 (DSR, random-skip, SPA, PBO). Still open: 1,000 random-entry/names nulls is just `--nulls 1000` (slow, not timed on real data).
 - **The prereg must specify the Sharpe sizing.** Proposal: equal notional 1/N, as implemented.
 - **The cost model uses IBKR commission while paper runs on Alpaca (commission-free).** That is pessimistic, so keep it, but say so.
+- **Cost at the exit leg** uses the trigger price (see Round 7, Decision 14).
 - **Live ranking feed:** on the free plan the 09:35 ranking is IEX-only. Measure IEX-vs-SIP top-N overlap on real data (`shadow_day_b.py --selection-feed iex` vs `sip` over DEV days) before paper; if < 80%, a SIP real-time plan or a different ranking input is needed (team decision).

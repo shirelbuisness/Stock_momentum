@@ -5,13 +5,13 @@ Goal: a machine that, after ALL costs, makes more money than it loses. Fail fast
 
 ## Where things stand (27.11.2026)
 - **Strategy B (ORB on Stocks in Play) is the current focus.** It has the strongest published evidence (Zarattini, Barbon & Aziz 2024).
-- Code: `strategy_b/` (standalone; not yet on the shared engine). **156 tests pass** (the Parquet one needs pyarrow; CI runs them all on every push: `.github/workflows/tests.yml`).
+- Code: `strategy_b/` (standalone; not yet on the shared engine). **161 tests pass** (the Parquet one needs pyarrow; CI runs them all on every push: `.github/workflows/tests.yml`).
 - **NOTHING has run on real market data yet.** Every result so far is synthetic. The next step is the real Alpaca probe.
 - Strategy A (6 red candles → reversal) and C (SPY momentum) exist in the claude.ai Project "Stock Momentum's", not here.
   Another cloud session built `scripts/run_all.py` + `src/` for A in a repo that is NOT on GitHub. If it is needed, ask Shirel.
 
 ## Next step (do this first)
-1. `pip install -r requirements.txt && cd strategy_b && python -m pytest -q` → expect `156 passed` (~7 min; `155 passed, 1 skipped` without pyarrow).
+1. `pip install -r requirements.txt && cd strategy_b && python -m pytest -q` → expect `161 passed` (~8 min; `160 passed, 1 skipped` without pyarrow).
 2. Shirel sets `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` (free Alpaca account) in her shell or a gitignored `.env`.
 3. `python run_dev_a.py` (one command: probe → download → validate → DEV-A → ticks → rerun → shortlist → draft `docs/results-DEV-A.md`; stops at NO-GO). Step by step instead: `docs/strategy-B-data-runbook.md`.
 4. Read the draft with her: probe (GO / NO-GO, delisted-names line, 500-symbol line), data gate (+ `identity_warnings.csv`), the B0-replication sanity gate, then the numbers.
@@ -27,6 +27,8 @@ Goal: a machine that, after ALL costs, makes more money than it loses. Fail fast
 | `strategy_b/gate_stats.py` | DSR, random-skip null, Hansen SPA, PBO (CSCV), expected cone (iid + day-block) |
 | `strategy_b/gate_b.py` | Mechanical DEV-A shortlist / DEV-B confirmation / holdout pass gate per the prereg |
 | `strategy_b/run_dev_a.py` | The whole runbook as one command + a draft `docs/results-DEV-A.md` |
+| `strategy_b/run_dev_b.py` | DEV-B after signing: mechanical DEV-A shortlist → DEV-B (base + shortlist) → ticks → rerun → `gate_b.py confirm` → draft `docs/results-DEV-B.md` |
+| `docs/paper-order-path-B-design.md` | Paper order path design (DRAFT, to sign before any order code) + decisions D1–D6 |
 | `strategy_b/beta_b.py` | Market exposure of the long-only base vs SPY (plan v3 §5) |
 | `strategy_b/paper_gate_b.py` | Paper → live gate (slippage vs model, top-N overlap, expectancy CI), offline |
 | `strategy_b/nyse_calendar.py` | NYSE holidays + 13:00 closes 2015–2023 (default calendar of b_mvb.py) |
@@ -57,6 +59,6 @@ Goal: a machine that, after ALL costs, makes more money than it loses. Fail fast
 ## Known open issues
 - Alpaca's asset list is today's view, so long-delisted names may be missing (survivorship). The probe measures it.
 - Ticker reuse can mix companies: `validate` now lists likely cases (`data/identity_warnings.csv`) for a spot check, it does not remove them. The ETF filter is a name heuristic.
-- Built on the night of 27.11 (synthetic-tested only): DSR, random-skip null, Hansen SPA, PBO, day-block cone, `gate_b.py`, NYSE calendar, short shadow, dry run, Parquet. Session 2 the same night: market beta, B0-replication sanity gate, holdout pass-gate checker, `run_dev_a.py`, identity warnings, paper → live gate. Session 3: paper shadow logger (IEX-aware ranking), SIP-quote spread calibration, paper-gate rehearsal. See `docs/night-log-2026-11-27.md`.
+- Built on the night of 27.11 (synthetic-tested only): DSR, random-skip null, Hansen SPA, PBO, day-block cone, `gate_b.py`, NYSE calendar, short shadow, dry run, Parquet. Session 2 the same night: market beta, B0-replication sanity gate, holdout pass-gate checker, `run_dev_a.py`, identity warnings, paper → live gate. Session 3: paper shadow logger (IEX-aware ranking), SIP-quote spread calibration, paper-gate rehearsal. Session 4 (28.11): paper order path design doc, `run_dev_b.py`, fix: `fetch_b_data.py daily` now keeps earlier years and splits across calls. See `docs/night-log-2026-11-27.md`.
 - The cloud environment blocks `data.alpaca.markets` and has no keys: the real run must happen on Shirel's machine, or after the host + key are added to the environment.
 - The prereg must still pick: the Sharpe sizing, the breakeven-slippage threshold (1 or 2 ticks), the net-R bar (+0.05R or +0.08R), and the cost-filter multiple (3× or 5×).
