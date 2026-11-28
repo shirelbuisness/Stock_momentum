@@ -52,6 +52,6 @@ Work top to bottom. Mark `[x]` when done (commit + push after each).
 - [x] ae) Paper order path design doc → `docs/paper-order-path-B-design.md` (session 4; DRAFT for sign-off, no code) (no code until the team signs): risk.approve contract for B, bracket per name, client_order_id, reconciliation — per the order-risk skill; the shadow logger's model_refs.csv is the join key for real fills
 
 ## Refill 03:20 UTC, session 4 (z1, z3, ad still need keys; ae done)
-- [ ] af) `run_dev_b.py`: DEV-B in one command after signing (all 15 versions on 2021–2023 with --stress/--replication, ticks, tick rerun, `gate_b.py confirm`, draft `docs/results-DEV-B.md`); refuses without a DEV-A run + its shortlist, refuses 2024+; rehearsed against fake_alpaca
-- [ ] ag) Small fixes found while reading: dry_run_b docstring "15:59 close" wording (= close of the 15:58 bar)
+- [x] af) `run_dev_b.py`: DEV-B in one command after signing (all 15 versions on 2021–2023 with --stress/--replication, ticks, tick rerun, `gate_b.py confirm`, draft `docs/results-DEV-B.md`); refuses without a DEV-A run + its shortlist, refuses 2024+; rehearsed against fake_alpaca
+- [x] ag) Small fixes found while reading: dry_run_b docstring "15:59 close" wording (= close of the 15:58 bar)
 - [ ] ah) Boss review #7 (diff, verifier 100%, one number by hand) + docs refresh

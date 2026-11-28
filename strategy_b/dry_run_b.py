@@ -16,7 +16,7 @@ What it does at 09:35 ET on --day D:
 
 Order intent (one per candidate), per the plan: a DAY stop order 1 tick through the opening-range high (long) / low
 (short); protective stop = stop_atr x ATR14 from the fill (known only after the fill, so given as a distance);
-exit at the 15:59 close (12:59 on half days); cancel unfilled entries at the close. Quantity: 1x equal notional
+exit on the close of the 15:58 bar, i.e. at ~15:59:00 (12:58 bar on half days); cancel unfilled entries at the close. Quantity: 1x equal notional
 (equity / top_n / trigger), the prereg's Sharpe sizing proposal; the equal-$-risk quantity is shown next to it.
 client_order_id follows the order-risk skill format: {version}-{variant}-{SYMBOL}-{YYYYMMDD}-{seq:04d}-E1-r0.
 
