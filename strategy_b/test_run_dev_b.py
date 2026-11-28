@@ -69,8 +69,24 @@ def test_subset_is_verbatim_and_frozen_file_untouched(tmp_path):
     spec = {v["id"]: v for v in json.load(open(FROZEN))}
     assert json.load(open(tmp_path / "v.json")) == [spec[i] for i in ids]
     assert open(FROZEN).read() == before
+    a_knobs = RB._run_knobs(_dev_a_dummy(tmp_path))
+    assert RB.subset_variants(FROZEN, PICK, str(tmp_path / "x.json"), a_knobs) == ["B-v1__base"] + PICK
+    a_knobs[PICK[0]]["stop_atr"] = 0.3                                           # DEV-A ran a different L1
+    with pytest.raises(SystemExit, match="differ from the DEV-A"):
+        RB.subset_variants(FROZEN, PICK, str(tmp_path / "y.json"), a_knobs)
     with pytest.raises(SystemExit, match="not in"):
         RB.subset_variants(FROZEN, ["B-v1__made_up"], str(tmp_path / "w.json"))
+
+
+def _dev_a_dummy(tmp):
+    """A config.json as b_mvb.py writes it, for the frozen versions."""
+    from dataclasses import asdict
+    d = tmp / "dummy_run"
+    d.mkdir(exist_ok=True)
+    vs = B.load_variants(FROZEN)
+    json.dump(dict(args={}, variants=[dict(id=v.id, knobs=asdict(v.knobs), note=v.note) for v in vs]),
+              open(d / "config.json", "w"))
+    return str(d)
 
 
 def test_full_rehearsal_with_a_forced_shortlist(setup, tmp_path, monkeypatch):
@@ -93,6 +109,7 @@ def test_full_rehearsal_with_a_forced_shortlist(setup, tmp_path, monkeypatch):
     # the stop version was judged on a tick-resolved run, so the R9 check is absent, not failed
     stop_row = next(r for r in conf["rows"] if r["id"] == PICK[0])
     assert not any("R9" in c for c in stop_row["checks"])
+    assert any("does not judge the whole search" in n for n in conf["notes"])     # subset PBO is labelled
     log = pd.read_csv(tmp_path / "trials.csv")
     assert len(log) == 2 * (3 + 2)                                                # 3 versions + shadow + replication
     doc = open(path).read()

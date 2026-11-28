@@ -105,7 +105,10 @@ def confirm(a: dict, b: dict) -> dict:
     sb = b["summ"]
     base_trades = _f(sb.iloc[0].get("trades"))
     pbo = _f(b["gate"].get("pbo"))
-    if np.isfinite(pbo) and pbo > 0.3:
+    if len(sb) < len(a["summ"]):
+        notes.append(f"PBO on DEV-B = {pbo:.2f} comes from {len(sb)} of the {len(a['summ'])} DEV-A versions (base + "
+                     "shortlist): it does not judge the whole search; rerun DEV-B with all versions for that")
+    elif np.isfinite(pbo) and pbo > 0.3:
         notes.append(f"PBO = {pbo:.2f} > 0.3 on DEV-B: the search as a whole looks overfit (plan v3 §4)")
     rows = []
     for vid in sl["shortlist"]:

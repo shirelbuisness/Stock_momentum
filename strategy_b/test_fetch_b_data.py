@@ -80,6 +80,34 @@ def test_splits_become_split_factor(market, tmp_path):
     assert (d["split_factor"] != 1).sum() == 2
 
 
+def test_daily_later_calls_keep_earlier_history_and_splits(market, tmp_path):
+    """Night 28.11 finding: a second `daily` call with another range rebuilt daily.csv from ITS years only and
+    overwrote splits.csv, and a year first fetched in part was marked done for good."""
+    fake = FakeAlpaca(market, splits=[dict(symbol="T004", ex_date="2019-01-15", old_rate=10, new_rate=1),
+                                      dict(symbol="T003", ex_date="2019-02-11", old_rate=1, new_rate=4)])
+    c = client_for(fake)
+    F.main(["assets", "--data", str(tmp_path)], client=c)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-01-31"], client=c)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-02-01", "--end", "2019-03-31"], client=c)
+    d = pd.read_csv(tmp_path / "daily.csv", dtype={"ticker": str})
+    spy = d[d.ticker == "SPY"]
+    assert spy["date"].min() < "2019-01-10" and spy["date"].max() > "2019-02-20"     # both calls' days present
+    assert spy["date"].is_unique
+    f = d.set_index(["ticker", "date"])["split_factor"]
+    assert f[("T004", "2019-01-15")] == pytest.approx(0.1) and f[("T003", "2019-02-11")] == 4.0
+    # an overlapping full-range call: same splits once (no 4 x 4 = 16), same rows
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-03-31"], client=c)
+    d2 = pd.read_csv(tmp_path / "daily.csv", dtype={"ticker": str})
+    f2 = d2.set_index(["ticker", "date"])["split_factor"]
+    assert f2[("T003", "2019-02-11")] == 4.0 and (d2["split_factor"] != 1).sum() == 2
+    assert len(d2) == len(d2.drop_duplicates(["ticker", "date"])) and len(d2) >= len(d)
+    # a narrower call inside a fetched range downloads nothing new
+    n0 = len(fake.requests)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-01-31"], client=c)
+    assert not [p for p, _ in fake.requests[n0:] if p == "/v2/stocks/bars"]
+    assert len(pd.read_csv(tmp_path / "daily.csv")) == len(d2)
+
+
 def test_holdout_guard_on_download(tmp_path, market):
     with pytest.raises(SystemExit, match="HOLDOUT GUARD"):
         F.main(["opening", "--data", str(tmp_path), "--end", "2024-03-01"], client=client_for(FakeAlpaca(market)))

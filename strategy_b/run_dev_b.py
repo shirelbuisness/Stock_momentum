@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -43,10 +44,16 @@ HOLDOUT_START = "2024-01-01"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def subset_variants(frozen_path: str, ids: list[str], out_path: str) -> list[str]:
-    """Base + the given ids, copied verbatim (same dicts, same order as the frozen file)."""
+def subset_variants(frozen_path: str, ids: list[str], out_path: str, dev_a_knobs: dict | None = None) -> list[str]:
+    """Base + the given ids, copied verbatim (same dicts, same order as the frozen file). With dev_a_knobs
+    ({id: full knob dict from the DEV-A run's config.json}) each kept version must have the same knobs there."""
     spec = json.load(open(frozen_path))
     keep = {spec[0]["id"], *ids}
+    if dev_a_knobs is not None:
+        for v in spec:
+            if v["id"] in keep and v["id"] in dev_a_knobs and \
+                    json.loads(json.dumps(asdict(B.replace(B.Knobs(), **v.get("knobs", {}))))) != dev_a_knobs[v["id"]]:
+                sys.exit(f"{v['id']}: knobs in {frozen_path} differ from the DEV-A run's config: not the same version")
     missing = set(ids) - {v["id"] for v in spec}
     if missing:
         sys.exit(f"shortlisted ids not in {frozen_path}: {sorted(missing)}")
@@ -54,6 +61,10 @@ def subset_variants(frozen_path: str, ids: list[str], out_path: str) -> list[str
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     json.dump(sub, open(out_path, "w"), indent=2)
     return [v["id"] for v in sub]
+
+
+def _run_knobs(run: str) -> dict:
+    return {v["id"]: v["knobs"] for v in json.load(open(os.path.join(run, "config.json")))["variants"]}
 
 
 def write_draft(path: str, a, status: str, shortlist: dict, run1: str | None = None, run2: str | None = None,
@@ -153,7 +164,7 @@ def main(argv=None, client=None):
         vpath = a.variants
     else:
         vpath = os.path.join(a.runs, f"variants_devb_{stamp}.json")
-        subset_variants(a.variants, sl["shortlist"], vpath)
+        subset_variants(a.variants, sl["shortlist"], vpath, _run_knobs(a.dev_a))
     bt = ["--daily", os.path.join(a.data, "daily.csv"), "--minutes", os.path.join(a.data, "minutes"),
           "--variants", vpath, "--start", a.start, "--end", a.end, "--nulls", str(a.nulls), "--stress",
           "--replication", "--gate-reps", str(a.gate_reps), "--out", a.runs, "--trial-log", a.trial_log]

@@ -32,6 +32,7 @@ Usage (typical order):
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -147,6 +148,9 @@ class Manifest:
 
     def done(self, stage, piece):
         return piece in self.m.get(stage, [])
+
+    def pieces(self, stage):
+        return list(self.m.get(stage, []))
 
     def mark(self, stage, piece):
         self.m.setdefault(stage, [])
@@ -271,16 +275,24 @@ def stage_daily(client, data_dir, start, end, batch=500):
     os.makedirs(parts_dir, exist_ok=True)
     years = range(int(start[:4]), int(end[:4]) + 1)
     for y in years:
-        piece = f"{y}"
-        if man.done("daily", piece):
-            continue
         s, e = max(start, f"{y}-01-01"), min(end, f"{y}-12-31")
+        # the piece names the range actually fetched: a year first fetched in part (e.g. Jan-Mar) is fetched
+        # again when a later call needs more of it (night 28.11 finding: "2021" was marked done after Jan-Mar)
+        piece = f"{y}:{s}_{e}"
+        part = os.path.join(parts_dir, f"daily_{y}.csv")
+        if os.path.exists(part):
+            if _covering(man, "daily", y, s, e):
+                continue
+            # the part is REWRITTEN, so fetch the span of the old and the new range together
+            for s0, e0 in _covering(man, "daily", y, "9999", "0000", any_overlap=True):
+                s, e = min(s, s0), max(e, e0)
+            piece = f"{y}:{s}_{e}"
         # explicit NY timestamps: a date-only `end` can be read as 00:00 UTC, which drops the end day itself
         # (Dec 31 is a trading day in 2015 and 2018-2021). Night 27.11 finding.
         df = bars_frames(client, syms, "1Day", ny_to_utc(s, "00:00"), ny_to_utc(e, "23:59"), batch=batch)
         if not df.empty:
             df["date"] = df["ts_utc"].map(lambda x: utc_to_ny(x).strftime("%Y-%m-%d"))
-        atomic_csv(df, os.path.join(parts_dir, f"daily_{y}.csv"))
+        atomic_csv(df, part)
         man.mark("daily", piece)
         print(f"daily {y}: {len(df)} bars, {client.calls} calls so far", flush=True)
     # splits
@@ -291,11 +303,23 @@ def stage_daily(client, data_dir, start, end, batch=500):
                                         dict(symbols=",".join(group), types="forward_split,reverse_split",
                                              start=start, end=end, limit=1000)):
                 sp += list(_iter_splits(page_body))
-        atomic_csv(pd.DataFrame(sp, columns=["ticker", "date", "split_factor"]), os.path.join(data_dir, "splits.csv"))
+        sp_dir = os.path.join(data_dir, "splits_parts")
+        os.makedirs(sp_dir, exist_ok=True)
+        atomic_csv(pd.DataFrame(sp, columns=["ticker", "date", "split_factor"]),
+                   os.path.join(sp_dir, f"splits_{start}_{end}.csv"))
         man.mark("splits", f"{start}_{end}")
-    # assemble daily.csv
-    d = pd.concat([pd.read_csv(os.path.join(parts_dir, f"daily_{y}.csv"), dtype={"ticker": str}) for y in years],
-                  ignore_index=True)
+    # splits.csv = the union of every range ever fetched (a later, narrower call must not drop earlier splits);
+    # the same split seen by two overlapping ranges is ONE split (dedupe before the per-day product)
+    sp_dir = os.path.join(data_dir, "splits_parts")
+    sp_files = sorted(glob.glob(os.path.join(sp_dir, "splits_*.csv")))
+    sp_all = pd.concat([pd.read_csv(f, dtype={"ticker": str}) for f in sp_files], ignore_index=True) if sp_files \
+        else pd.DataFrame(columns=["ticker", "date", "split_factor"])
+    atomic_csv(sp_all.drop_duplicates(["ticker", "date", "split_factor"]).sort_values(["ticker", "date"]),
+               os.path.join(data_dir, "splits.csv"))
+    # assemble daily.csv from EVERY downloaded year, not only this call's years (a later call for 2021 must not
+    # drop 2015-2020 from daily.csv; night 28.11 finding)
+    parts = sorted(glob.glob(os.path.join(parts_dir, "daily_*.csv")))
+    d = pd.concat([pd.read_csv(f, dtype={"ticker": str}) for f in parts], ignore_index=True)
     d = d.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     sp = pd.read_csv(os.path.join(data_dir, "splits.csv"), dtype={"ticker": str})
     sp = sp.groupby(["ticker", "date"], as_index=False)["split_factor"].prod()
@@ -304,6 +328,18 @@ def stage_daily(client, data_dir, start, end, batch=500):
     d = d[["ticker", "date", "open", "high", "low", "close", "volume", "split_factor"]].sort_values(["ticker", "date"])
     atomic_csv(d, os.path.join(data_dir, "daily.csv"))
     print(f"daily.csv: {len(d)} rows, {d['ticker'].nunique()} tickers, {int((d['split_factor'] != 1).sum())} split days")
+
+
+def _covering(man, stage: str, y: int, s: str, e: str, any_overlap: bool = False) -> list[tuple[str, str]]:
+    """Ranges already fetched for year y (manifest pieces 'y:s0_e0') that cover [s, e] (any_overlap: all)."""
+    out = []
+    for piece in man.pieces(stage):
+        yy, _, rng = str(piece).partition(":")
+        if yy == str(y) and rng:
+            s0, _, e0 = rng.partition("_")
+            if any_overlap or (s0 <= s and e <= e0):
+                out.append((s0, e0))
+    return out
 
 
 def _paged_raw(client, path, params):
