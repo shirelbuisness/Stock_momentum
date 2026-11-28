@@ -41,20 +41,31 @@ def load_day(minutes_dir: str, day: str) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------- independent verifier
+HALF_DAYS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyse_early_closes.csv")
+
+
+def half_days(path: str = HALF_DAYS_CSV) -> set[str]:
+    """NYSE 13:00 closes, read straight from the committed CSV (not from b_mvb.py)."""
+    if not os.path.exists(path):
+        return set()
+    return set(pd.read_csv(path, dtype=str)["date"])
+
+
 def independent_trade(bars: pd.DataFrame, atr: float, stop_atr=0.10, hs_bp=3.0, slip_ticks=1.0, slip_bp=2.0,
-                      comm=0.0035, time_stop=None, time_stop_r=0.5, ohlc_path=False):
+                      comm=0.0035, time_stop=None, time_stop_r=0.5, ohlc_path=False, last_bar="15:58"):
     """Long-only base rules written from the plan text, NOT from simulate_trade:
     OR = 09:30-09:34. Green OR bar -> buy stop at OR high. From 09:35, first 1-min bar whose high is at
     least 1 tick above the trigger fills at max(trigger, open) + half spread + slippage. Stop = fill - stop_atr*ATR.
     Same bar reaching the stop -> stopped. Later bars: open below stop -> exit at open; low at/below stop -> exit at
-    stop; both minus half spread + slippage. Otherwise exit at the close of the last bar <= 15:58."""
+    stop; both minus half spread + slippage. Otherwise exit at the close of the last bar <= `last_bar`
+    (15:58; 12:58 on a 13:00 half day)."""
     orb = bars[(bars.t >= tmin("09:30")) & (bars.t < tmin("09:35"))]
     if orb.empty or orb.c.iloc[-1] <= orb.o.iloc[0]:
         return None
     trig = orb.h.max()
     hs = max(0.005, trig * hs_bp / 1e4)
     k = max(slip_ticks * TICK, trig * slip_bp / 1e4)
-    day_bars = bars[(bars.t >= tmin("09:35")) & (bars.t <= tmin("15:58"))].reset_index(drop=True)
+    day_bars = bars[(bars.t >= tmin("09:35")) & (bars.t <= tmin(last_bar))].reset_index(drop=True)
     entry = None
     for i, b in day_bars.iterrows():
         if entry is None:
@@ -93,11 +104,12 @@ def verify_all(trades: pd.DataFrame, minutes_dir: str, variant: str, **rule) -> 
     t = trades[(trades.variant == variant)]
     ok, bad, rows = 0, 0, []
     cache = {}
+    halves = half_days()
     for _, tr in t.iterrows():
         if tr.day not in cache:
             cache[tr.day] = load_day(minutes_dir, tr.day)
         bars = cache[tr.day][cache[tr.day].ticker == tr.ticker].sort_values("t")
-        ind = independent_trade(bars, tr.atr14, **rule)
+        ind = independent_trade(bars, tr.atr14, last_bar="12:58" if tr.day in halves else "15:58", **rule)
         if not tr.filled:
             same = ind is not None and ind["reason"] == "no_trigger" and tr.reason == "no_trigger"
         else:

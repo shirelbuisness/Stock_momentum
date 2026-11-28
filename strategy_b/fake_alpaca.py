@@ -29,13 +29,20 @@ def _parse(ts):
 
 
 class FakeAlpaca:
-    def __init__(self, market_dir, splits=None, inactive=None):
+    def __init__(self, market_dir, splits=None, inactive=None, iex_volume=None, spread_bp=None):
         self.daily = pd.read_csv(os.path.join(market_dir, "daily.csv"), dtype={"ticker": str})
         self.mdir = os.path.join(market_dir, "minutes")
         self.splits = splits or []            # [{"symbol","ex_date","old_rate","new_rate"}]
         self.inactive = set(inactive or [])
+        # feed=iex minute bars: volume multiplier, a dict ticker -> share or a callable (ticker, day) -> share
+        self.iex_volume = iex_volume or {}
+        self.spread_bp = spread_bp or {}      # /v2/stocks/quotes: ticker -> full NBBO spread in bp (default 6)
         self._minutes = {}
         self.requests = []
+
+    def _iex_share(self, ticker, day):
+        f = self.iex_volume
+        return float(f(ticker, day)) if callable(f) else float(f.get(ticker, 1.0))
 
     def _day_minutes(self, day):
         if day not in self._minutes:
@@ -61,6 +68,8 @@ class FakeAlpaca:
             return 200, self._bars(q)
         if u.path == "/v2/stocks/trades":
             return 200, self._trades(q)
+        if u.path == "/v2/stocks/quotes":
+            return 200, self._quotes(q)
         if u.path == "/v1/corporate-actions":
             return 200, self._ca(q)
         return 404, {"message": "not found"}
@@ -73,10 +82,11 @@ class FakeAlpaca:
                 continue
             etf = t == "SPY"
             out.append(dict(symbol=t, name="SPDR S&P 500 ETF Trust" if etf else f"{t} Holdings Inc",
-                            exchange="ARCA" if etf else "NASDAQ", status=st, tradable=st == "active"))
+                            exchange="ARCA" if etf else "NASDAQ", status=st, tradable=st == "active",
+                            shortable=st == "active", easy_to_borrow=st == "active" and not t.endswith("7")))
         return out
 
-    def _rows_bars(self, syms, tf, start, end):
+    def _rows_bars(self, syms, tf, start, end, feed="sip"):
         rows = []
         if tf == "1Day":
             d = self.daily[self.daily["ticker"].isin(syms)]
@@ -91,7 +101,8 @@ class FakeAlpaca:
             if m is not None:
                 x = m[m["ticker"].isin(syms) & (m["ts"] >= start) & (m["ts"] <= end)]
                 for _, r in x.iterrows():
-                    rows.append((r["ticker"], r["ts"], dict(o=r["o"], h=r["h"], l=r["l"], c=r["c"], v=int(r["v"]),
+                    v = r["v"] * (self._iex_share(r["ticker"], day) if feed == "iex" else 1.0)
+                    rows.append((r["ticker"], r["ts"], dict(o=r["o"], h=r["h"], l=r["l"], c=r["c"], v=int(v),
                                                             n=1, vw=r["c"])))
         rows.sort(key=lambda z: (z[0], z[1]))
         return rows
@@ -108,7 +119,8 @@ class FakeAlpaca:
 
     def _bars(self, q):
         syms = q["symbols"].split(",")
-        return self._page(self._rows_bars(syms, q["timeframe"], _parse(q["start"]), _parse(q["end"])), q, "bars")
+        return self._page(self._rows_bars(syms, q["timeframe"], _parse(q["start"]), _parse(q["end"]),
+                                          q.get("feed", "sip")), q, "bars")
 
     def _trades(self, q):
         syms = q["symbols"].split(",")
@@ -128,6 +140,29 @@ class FakeAlpaca:
                              dict(p=round(p, 4), s=100, x="V", c=["@"], i=i, z="C")))
         rows.sort(key=lambda z: (z[0], z[1]))
         return self._page(rows, q, "trades")
+
+    def _quotes(self, q):
+        """One NBBO quote every 2 s around the bar's close: spread = spread_bp of the mid; every 5th quote is
+        locked (bid = ask) and the 7th one-sided (bid 0), which a correct parser must drop."""
+        syms = q["symbols"].split(",")
+        start, end = _parse(q["start"]), _parse(q["end"])
+        minute = start.replace(second=0)
+        rows = []
+        for sym, ts, b in self._rows_bars(syms, "1Min", minute, minute):
+            mid = float(b["c"])
+            half = mid * self.spread_bp.get(sym, 6.0) / 2e4
+            for i in range(30):
+                t = ts.replace(second=2 * i)
+                if not (start <= t < end):
+                    continue
+                bid, ask = mid - half, mid + half
+                if i % 5 == 4:
+                    bid = ask
+                if i == 7:
+                    bid = 0.0
+                rows.append((sym, t, dict(bp=round(bid, 6), ap=round(ask, 6), bs=1, as_=1, bx="V", ax="V", c=["R"], z="C")))
+        rows.sort(key=lambda z: (z[0], z[1]))
+        return self._page(rows, q, "quotes")
 
     def _ca(self, q):
         syms = set(q.get("symbols", "").split(","))

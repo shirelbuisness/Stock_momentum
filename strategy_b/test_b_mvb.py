@@ -310,3 +310,94 @@ def test_random_walk_has_no_gross_edge(tmp_path):
 def test_planted_momentum_is_detected(tmp_path):
     f, t = _run(tmp_path, momentum=0.6, seed=12)
     assert t > 3, f"planted edge not found (t={t:.2f})"
+
+
+# ------------------------------------------------------------------ night 27.11: breakeven bp + scratches
+def _fake_runs(means):
+    return [pd.DataFrame({"filled": [True, True], "r_net": [m - 0.1, m + 0.1]}) for m in means]
+
+
+def test_breakeven_bp_interpolates_on_the_bp_grid():
+    # mean R over BE_BPS = 0, 2.5, 5, 10, 20, 40 bp: 0.30, 0.20, 0.10, -0.10, ... -> zero at 5 + 0.1/0.2*5 = 7.5 bp
+    runs = _fake_runs([0.30, 0.20, 0.10, -0.10, -0.5, -1.0])
+    assert B.breakeven_from(runs, B.BE_BPS) == pytest.approx(7.5)
+    assert B.breakeven_from(_fake_runs([0.3] * 6), B.BE_BPS) == np.inf
+    assert B.breakeven_from(_fake_runs([-0.01] * 6), B.BE_BPS) == 0.0
+    assert B.breakeven_from(_fake_runs([0.4, 0.3, 0.2, 0.1, -0.1])) == pytest.approx(3.5)   # ticks (default grid)
+
+
+def test_breakeven_bp_matches_ticks_through_the_price_level(tmp_path):
+    make_market(str(tmp_path), n_tickers=40, n_days=45, seed=23, momentum=0.04)
+    v = _write_variants(tmp_path, [{"id": "b", "knobs": {"min_avg_vol": 0, "sides": "both"}}])
+    out = B.main(["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"),
+                  "--start", "2019-01-23", "--end", "2019-12-31", "--nulls", "0", "--breakeven", "--variants", v,
+                  "--gate-reps", "50", "--out", str(tmp_path / "runs"), "--trial-log", str(tmp_path / "t.csv")])
+    s = pd.read_csv(os.path.join(out, "summary.csv")).iloc[0]
+    tr = pd.read_csv(os.path.join(out, "trades.csv"))
+    f = tr[tr["filled"]]
+    bp_per_tick = 1e4 * B.TICK / f["entry_px"].abs()
+    assert np.isfinite(s["breakeven_bp"]) and np.isfinite(s["breakeven_ticks"]) and s["breakeven_ticks"] > 0
+    ratio = s["breakeven_bp"] / s["breakeven_ticks"]                 # bp per tick implied by the two grids
+    assert bp_per_tick.min() * 0.8 <= ratio <= bp_per_tick.max() * 1.2
+
+
+def test_scratches_are_counted_apart_from_wins_and_losses():
+    tr = pd.DataFrame(dict(filled=True, r_net=[2.0, 0.03, -0.02, 0.0, -1.0, -1.0], r_gross=0.0, day="2019-01-02",
+                           entry_t=575, same_bar_stop=False, same_bar_source="", ret_net=0.0, reason="close"))
+    s = B.summarize(tr, ["2019-01-02"], 20, scratch_r=0.05)
+    assert s["win_rate"] == pytest.approx(2 / 6)                    # old definition: r > 0
+    assert s["scratch_pct"] == pytest.approx(3 / 6)
+    assert s["win_pct_ex_scratch"] == pytest.approx(1 / 6) and s["loss_pct_ex_scratch"] == pytest.approx(2 / 6)
+    assert s["scratch_sum_R"] == pytest.approx(0.01)
+
+
+# ------------------------------------------------------------------ night 27.11: short shadow (SSR / ETB)
+def test_ssr_at_entry_known_answers():
+    b = B.Bars(bars([("09:30", 10.0, 10.1, 9.20, 9.3), ("09:35", 9.3, 9.4, 9.05, 9.1), ("09:36", 9.1, 9.2, 8.95, 9.0)]))
+    row = {"prev_close_t": 10.0, "ssr_carry": False}
+    assert not B.ssr_at_entry(b, B.hm("09:35"), row)             # lowest print by 09:35 = 9.05 > 9.00
+    assert B.ssr_at_entry(b, B.hm("09:36"), row)                 # the entry bar itself reaches 8.95 (inclusive)
+    assert B.ssr_at_entry(b, B.hm("09:35"), {"prev_close_t": 10.0, "ssr_carry": True})   # carried from yesterday
+    assert not B.ssr_at_entry(b, B.hm("09:36"), {"prev_close_t": np.nan, "ssr_carry": False})
+
+
+def test_ssr_carry_comes_from_the_prior_session_only_and_ignores_splits():
+    days = list(pd.bdate_range("2020-01-01", periods=6).strftime("%Y-%m-%d"))
+    rows = []
+    for i, d in enumerate(days):
+        if i == 2:                                     # day 2: low 8.9 vs prior close 10 -> SSR trigger on day 2
+            rows.append(dict(ticker="X", date=d, open=10, high=10, low=8.9, close=9.5, volume=1, split_factor=1.0))
+        elif i == 4:                                   # day 4: a 2:1 split; raw low 4.9 is NOT a 51% drop
+            rows.append(dict(ticker="X", date=d, open=5, high=5.1, low=4.9, close=5, volume=1, split_factor=2.0))
+        else:
+            rows.append(dict(ticker="X", date=d, open=10, high=10.1, low=9.9, close=10, volume=1, split_factor=1.0))
+    f = B.daily_features(B.load_daily_df(pd.DataFrame(rows)), 2).set_index("date")
+    assert f["ssr_carry"].tolist() == [False, False, False, True, False, False]
+    assert f.loc[days[4], "prev_close_t"] == pytest.approx(5.0)          # 10 in the post-split scale
+
+
+def test_short_shadow_run_is_separate_flagged_and_logged(tmp_path):
+    make_market(str(tmp_path), n_tickers=40, n_days=45, seed=24, momentum=0.1)
+    sec = pd.DataFrame({"ticker": [f"T{i:03d}" for i in range(40)]})
+    sec["easy_to_borrow"] = [i % 4 != 0 for i in range(40)]
+    sec.to_csv(tmp_path / "securities.csv", index=False)
+    v = _write_variants(tmp_path, [{"id": "b", "knobs": {"min_avg_vol": 0}}])
+    args = ["--daily", str(tmp_path / "daily.csv"), "--minutes", str(tmp_path / "minutes"), "--start", "2019-01-23",
+            "--end", "2019-12-31", "--nulls", "0", "--variants", v, "--gate-reps", "20",
+            "--securities", str(tmp_path / "securities.csv"), "--out", str(tmp_path / "runs"),
+            "--trial-log", str(tmp_path / "t.csv")]
+    out = B.main(args)
+    tr = pd.read_csv(os.path.join(out, "trades.csv"))
+    sh = tr[tr["variant"] == "b__shadow_short"]
+    assert len(sh) > 50 and (sh["side"] == -1).all() and (tr.loc[tr["variant"] == "b", "side"] == 1).all()
+    f = sh[sh["filled"]]
+    assert f["ssr"].notna().all() and f["etb"].notna().all()
+    assert set(f.loc[f["ticker"].isin(["T000", "T004"]), "etb"]) <= {False}
+    log = pd.read_csv(tmp_path / "t.csv")
+    assert list(log["variant_id"]) == ["b", "b__shadow_short"]                     # the shadow counts as a trial
+    s = pd.read_csv(os.path.join(out, "summary.csv"))
+    assert list(s["id"]) == ["b"]                                                 # never in the version table
+    rep = open(os.path.join(out, "report.md")).read()
+    assert "Short shadow (backtest only" in rep and "easy-to-borrow only" in rep
+    out2 = B.main(args[:-4] + ["--no-short-shadow", "--out", str(tmp_path / "r2"), "--trial-log", str(tmp_path / "t2.csv")])
+    assert "Short shadow" not in open(os.path.join(out2, "report.md")).read()

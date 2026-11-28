@@ -80,6 +80,34 @@ def test_splits_become_split_factor(market, tmp_path):
     assert (d["split_factor"] != 1).sum() == 2
 
 
+def test_daily_later_calls_keep_earlier_history_and_splits(market, tmp_path):
+    """Night 28.11 finding: a second `daily` call with another range rebuilt daily.csv from ITS years only and
+    overwrote splits.csv, and a year first fetched in part was marked done for good."""
+    fake = FakeAlpaca(market, splits=[dict(symbol="T004", ex_date="2019-01-15", old_rate=10, new_rate=1),
+                                      dict(symbol="T003", ex_date="2019-02-11", old_rate=1, new_rate=4)])
+    c = client_for(fake)
+    F.main(["assets", "--data", str(tmp_path)], client=c)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-01-31"], client=c)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-02-01", "--end", "2019-03-31"], client=c)
+    d = pd.read_csv(tmp_path / "daily.csv", dtype={"ticker": str})
+    spy = d[d.ticker == "SPY"]
+    assert spy["date"].min() < "2019-01-10" and spy["date"].max() > "2019-02-20"     # both calls' days present
+    assert spy["date"].is_unique
+    f = d.set_index(["ticker", "date"])["split_factor"]
+    assert f[("T004", "2019-01-15")] == pytest.approx(0.1) and f[("T003", "2019-02-11")] == 4.0
+    # an overlapping full-range call: same splits once (no 4 x 4 = 16), same rows
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-03-31"], client=c)
+    d2 = pd.read_csv(tmp_path / "daily.csv", dtype={"ticker": str})
+    f2 = d2.set_index(["ticker", "date"])["split_factor"]
+    assert f2[("T003", "2019-02-11")] == 4.0 and (d2["split_factor"] != 1).sum() == 2
+    assert len(d2) == len(d2.drop_duplicates(["ticker", "date"])) and len(d2) >= len(d)
+    # a narrower call inside a fetched range downloads nothing new
+    n0 = len(fake.requests)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-01-31"], client=c)
+    assert not [p for p, _ in fake.requests[n0:] if p == "/v2/stocks/bars"]
+    assert len(pd.read_csv(tmp_path / "daily.csv")) == len(d2)
+
+
 def test_holdout_guard_on_download(tmp_path, market):
     with pytest.raises(SystemExit, match="HOLDOUT GUARD"):
         F.main(["opening", "--data", str(tmp_path), "--end", "2024-03-01"], client=client_for(FakeAlpaca(market)))
@@ -180,3 +208,64 @@ def test_ticks_decide_unit():
     assert B.ticks_decide(np.array([9.9, 10.00]), 1, 10.00, 9.80) is None
     # short mirror: trigger 10.00 (long space -10.00), stop 10.20 (long space -10.20)
     assert B.ticks_decide(np.array([10.1, 9.99, 10.21]), -1, -10.00, -10.20) is True
+
+
+def test_validate_lists_calendar_warnings_without_failing_the_gate(downloaded):
+    data, _, _ = downloaded
+    rep = F.stage_validate(data)
+    cal = rep[rep["file"] == "calendar"]
+    # the synthetic market uses business days, so MLK day and Presidents' Day 2019 have files
+    assert {"2019-01-21", "2019-02-18"} <= set(cal["day"])
+    assert cal["problem"].str.startswith("WARN").all()
+
+
+def test_assets_keep_todays_borrow_flags(downloaded):
+    data, _, _ = downloaded
+    s = pd.read_csv(os.path.join(data, "securities.csv"), dtype={"ticker": str})
+    assert {"shortable", "easy_to_borrow"} <= set(s.columns)
+    assert "not as of the trade date" in open(os.path.join(data, "README_data.md")).read()
+
+
+def test_daily_includes_the_end_day_itself(market, tmp_path):
+    c = client_for(FakeAlpaca(market))
+    F.main(["assets", "--data", str(tmp_path)], client=c)
+    F.main(["daily", "--data", str(tmp_path), "--start", "2019-01-01", "--end", "2019-02-21"], client=c)
+    d = pd.read_csv(tmp_path / "daily.csv")
+    assert d["date"].max() == "2019-02-21" and d["date"].min() == "2019-01-02"
+
+
+# ------------------------------------------------------------------ identity breaks (ticker reuse), task u
+def _d(rows):
+    return pd.DataFrame([dict(ticker=t, date=d, open=o, high=max(o, c), low=min(o, c), close=c, volume=1,
+                              split_factor=sf) for t, d, o, c, sf in rows])
+
+
+def test_identity_breaks_known_answers():
+    rows = [("OLD", "2019-03-01", 100, 101, 1.0),          # company A ...
+            ("OLD", "2019-06-03", 8.0, 8.1, 1.0),          # ... same symbol, new company 3 months later -> jump + gap
+            ("SPL", "2019-03-01", 400, 400, 1.0), ("SPL", "2019-03-04", 101, 100, 4.0),   # 4:1 split, factor -> ok
+            ("BAD", "2019-03-01", 400, 400, 1.0), ("BAD", "2019-03-04", 101, 100, 1.0),   # split missing -> jump
+            ("BIO", "2019-03-01", 10, 10, 1.0), ("BIO", "2019-03-04", 25, 24, 1.0),       # 2.5x news gap -> ok
+            ("REL", "2019-03-01", 20, 20, 1.0), ("REL", "2019-05-01", 31, 31, 1.0),       # 61 days, +55% -> gap
+            ("QUI", "2019-03-01", 20, 20, 1.0), ("QUI", "2019-05-01", 22, 22, 1.0)]       # 61 days, +10% -> ok
+    ib = F.identity_breaks(_d(rows))
+    got = {(r.ticker, r.kind) for r in ib.itertuples()}
+    assert got == {("OLD", "jump"), ("BAD", "jump"), ("REL", "gap")}
+    assert ib.set_index("ticker").loc["OLD", "days_since_prev_bar"] == 94
+
+
+def test_validate_writes_identity_warnings_and_does_not_gate(downloaded, tmp_path):
+    import shutil
+    data, _, _ = downloaded
+    F.main(["validate", "--data", data])
+    assert len(pd.read_csv(os.path.join(data, "identity_warnings.csv"))) == 0        # clean synthetic market
+    bad = tmp_path / "reuse"
+    shutil.copytree(data, bad)
+    d = pd.read_csv(bad / "daily.csv")
+    t = d["ticker"].iloc[0]
+    later = d["ticker"].eq(t) & (d["date"] > d.loc[d["ticker"].eq(t), "date"].iloc[20])
+    d.loc[later, ["open", "high", "low", "close"]] *= 5                               # a different company
+    d.to_csv(bad / "daily.csv", index=False)
+    F.main(["validate", "--data", str(bad)])                                          # WARN only: still passes
+    rep = pd.read_csv(bad / "validation.csv")
+    assert (rep["file"] == "identity").sum() == 1 and t in rep.loc[rep["file"] == "identity", "problem"].iloc[0]

@@ -28,6 +28,8 @@ import json
 import math
 import os
 import sys
+from contextlib import contextmanager
+from functools import lru_cache
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 
@@ -52,7 +54,7 @@ class Knobs:
     # signal / entry
     or_minutes: int = 5             # opening range length
     entry_bar2: bool = False        # F6: confirmation. Trigger = max(OR high, 2nd bar high), entries after bar 2
-    sides: str = "long"             # "long" | "both"
+    sides: str = "long"             # "long" | "both" | "short" (short = the backtest-only shadow)
     entry_cutoff: str = "15:58"     # last bar START at which an entry may trigger
     spy_filter: bool = False        # longs only if SPY prior close -> OR close return > 0 (shorts mirror)
     max_or_range_atr: float = 0.0   # 0 = off; skip if OR range > x * ATR (exhausted move)
@@ -104,6 +106,7 @@ def load_variants(path: str | None) -> list[Variant]:
 
 
 # ----------------------------------------------------------------------------- data
+@lru_cache(maxsize=4096)
 def hm(t: str) -> int:
     h, m = t.split(":")
     return int(h) * 60 + int(m)
@@ -113,7 +116,7 @@ OPEN_MIN = hm("09:30")
 
 
 def load_daily(path: str) -> pd.DataFrame:
-    return load_daily_df(pd.read_csv(path, dtype={"ticker": str}))
+    return load_daily_df(read_table(path, dtype={"ticker": str}))
 
 
 def load_daily_df(d: pd.DataFrame) -> pd.DataFrame:
@@ -148,20 +151,37 @@ def daily_features(d: pd.DataFrame, hist: int) -> pd.DataFrame:
     d["avgvol_overF"] = g["vol_over_F"].transform(lambda s: s.shift(1).rolling(hist, min_periods=hist).mean())
     d["atr14"] = d["atr_F"] / d["F"]
     d["avg_vol14"] = d["avgvol_overF"] * d["F"]
-    return d[["ticker", "date", "F", "atr14", "avg_vol14"]]
+    # short shadow only: SEC Rule 201 (SSR) is triggered by a trade >= 10% below the prior close and lasts the rest
+    # of that day AND the next day. ssr_carry(t) = the trigger happened on the prior session (known before 09:30).
+    d["prev_close_t"] = prev_close_scaled
+    trig = (d["low"] <= 0.9 * prev_close_scaled).astype(float).where(prev_close_scaled.notna())
+    d["ssr_carry"] = trig.groupby(d["ticker"], sort=False).shift(1).fillna(0.0).astype(bool)
+    return d[["ticker", "date", "F", "atr14", "avg_vol14", "prev_close_t", "ssr_carry"]]
 
 
 def minute_files(dirpath: str) -> dict[str, str]:
-    out = {}
-    for p in glob.glob(os.path.join(dirpath, "minutes_*.csv")):
-        day = os.path.basename(p)[len("minutes_"):-4]
-        out[day] = p
+    """day -> minute file. CSV (the downloader's output) or Parquet (to_parquet.py copies). A directory must hold
+    ONE format: mixing them would make the data fingerprint and the day set ambiguous."""
+    out, kinds = {}, set()
+    for ext in (".csv", ".parquet"):
+        for p in glob.glob(os.path.join(dirpath, f"minutes_*{ext}")):
+            out[os.path.basename(p)[len("minutes_"):-len(ext)]] = p
+            kinds.add(ext)
+    if len(kinds) > 1:
+        sys.exit(f"{dirpath} holds both CSV and Parquet minute files: point --minutes at one format")
     return dict(sorted(out.items()))
 
 
+def read_table(path: str, dtype: dict | None = None) -> pd.DataFrame:
+    """CSV or Parquet by extension (Parquet needs pyarrow; it is optional)."""
+    if path.endswith(".parquet"):
+        return pd.read_parquet(path)
+    return pd.read_csv(path, dtype=dtype)
+
+
 def load_minutes(path: str) -> pd.DataFrame:
-    m = pd.read_csv(path, dtype={"ticker": str, "time": str})
-    m["tmin"] = m["time"].map(hm)
+    m = read_table(path, dtype={"ticker": str, "time": str})
+    m["tmin"] = m["time"].map(hm)                 # hm() is lru-cached: ~400 distinct values per file
     return m.sort_values(["ticker", "tmin"]).reset_index(drop=True)
 
 
@@ -243,7 +263,16 @@ def ticks_decide(prices: np.ndarray, side: int, trig_ls: float, stop_ls: float) 
     return bool(after.size and after.min() <= stop_ls + 1e-9)
 
 
-def simulate_trade(bars: pd.DataFrame, side: int, trigger: float, atr: float, k: Knobs,
+class Bars:
+    """One ticker-day of 1-min bars as numpy arrays, sorted by tmin (speed: built once per ticker per day)."""
+    __slots__ = ("t", "o", "h", "l", "c")
+
+    def __init__(self, df: pd.DataFrame):
+        self.t = df["tmin"].to_numpy()
+        self.o, self.h, self.l, self.c = (df[x].to_numpy(dtype=float) for x in ("o", "h", "l", "c"))
+
+
+def simulate_trade(bars, side: int, trigger: float, atr: float, k: Knobs,
                    start_t: int, close_t: int, or_other_side: float, tick_lookup=None) -> TradeResult:
     """Pessimistic 1-min fill model. side=+1 long, -1 short. bars sorted by tmin (RTH).
 
@@ -254,11 +283,18 @@ def simulate_trade(bars: pd.DataFrame, side: int, trigger: float, atr: float, k:
     Breakeven / trailing changes take effect from the NEXT bar after the trigger bar (no same-bar optimism).
     Close: exit at the close of the last bar <= close_t, minus half spread and k.
     """
-    b = bars[(bars["tmin"] >= start_t) & (bars["tmin"] <= close_t)]
-    if b.empty:
-        return TradeResult(False, exit_reason="no_bars")
-    t = b["tmin"].to_numpy()
-    o, h, l, c = (b[x].to_numpy(dtype=float) for x in ("o", "h", "l", "c"))
+    if isinstance(bars, Bars):                      # sorted arrays: slice instead of a boolean mask
+        lo_, hi_ = np.searchsorted(bars.t, start_t, "left"), np.searchsorted(bars.t, close_t, "right")
+        if hi_ <= lo_:
+            return TradeResult(False, exit_reason="no_bars")
+        t = bars.t[lo_:hi_]
+        o, h, l, c = bars.o[lo_:hi_], bars.h[lo_:hi_], bars.l[lo_:hi_], bars.c[lo_:hi_]
+    else:
+        b = bars[(bars["tmin"] >= start_t) & (bars["tmin"] <= close_t)]
+        if b.empty:
+            return TradeResult(False, exit_reason="no_bars")
+        t = b["tmin"].to_numpy()
+        o, h, l, c = (b[x].to_numpy(dtype=float) for x in ("o", "h", "l", "c"))
     # work in "long space": for shorts flip prices so the same code applies
     if side < 0:
         o, h, l, c = -o, -l, -h, -c
@@ -363,8 +399,16 @@ def simulate_trade(bars: pd.DataFrame, side: int, trigger: float, atr: float, k:
 
 
 # ----------------------------------------------------------------------------- one day
-def day_candidates(ot_day: pd.DataFrame, dfe_day: pd.DataFrame, k: Knobs) -> pd.DataFrame:
-    x = ot_day[ot_day["L"] == k.or_minutes].merge(
+def candidate_key(k: Knobs) -> tuple:
+    """Every knob day_candidates() reads: two specs with the same key get the same candidates."""
+    return (k.or_minutes, k.min_price, k.min_avg_vol, k.min_atr, k.rvol_min, k.top_n, k.max_or_range_atr,
+            k.close_loc_min, k.sides)
+
+
+def day_candidates(ot_day: pd.DataFrame, dfe_day: pd.DataFrame, k: Knobs, merged: pd.DataFrame | None = None) \
+        -> pd.DataFrame:
+    """`merged` = the precomputed ot_day[L] x dfe_day join (speed); computed here when not given."""
+    x = merged if merged is not None else ot_day[ot_day["L"] == k.or_minutes].merge(
         dfe_day.rename(columns={"date": "day"}), on=["ticker", "day"], how="inner")
     x = x[x["ticker"] != "SPY"]
     x = x[(x["first_t"] == OPEN_MIN) & (x["nbars"] >= max(1, k.or_minutes - 1))]  # halted / late open -> drop
@@ -382,12 +426,15 @@ def day_candidates(ot_day: pd.DataFrame, dfe_day: pd.DataFrame, k: Knobs) -> pd.
         x = x[loc >= k.close_loc_min]
     if k.sides == "long":
         x = x[x["side"] == 1]
+    elif k.sides == "short":
+        x = x[x["side"] == -1]
     return x
 
 
 SPY_PREV: dict[str, float] = {}   # day -> SPY prior-session close (raw), filled in main()
 EARLY_CLOSES: dict[str, str] = {}  # day -> "HH:MM" official close (e.g. "13:00"), optional calendar
 TICKS: dict[tuple, np.ndarray] = {}  # (day, ticker, minute) -> tick prices in time order (fetch_b_data.py ticks)
+BORROW: dict[str, bool] = {}  # ticker -> easy_to_borrow TODAY (securities.csv; labels the short shadow only)
 
 
 def load_ticks(path: str) -> int:
@@ -396,21 +443,46 @@ def load_ticks(path: str) -> int:
         TICKS[(key[0], key[1], int(key[2]))] = g["price"].to_numpy(dtype=float)
     return len(TICKS)
 FULL_DAY_MIN_LAST_BAR = hm("15:00")  # a ticker counts as "has full-day bars" if its last bar starts >= 15:00
-TRADE_COLS = list(TradeResult.__dataclass_fields__) + ["day", "ticker", "side", "rvol", "atr14", "reason"]
+TRADE_COLS = list(TradeResult.__dataclass_fields__) + ["day", "ticker", "side", "rvol", "atr14", "reason", "ssr", "etb"]
+
+
+CAL_STATE = {"strict": False, "source": "none (half days inferred from the last bar)"}
+
+
+@contextmanager
+def calendar_context(early: dict[str, str], strict: bool, source: str = ""):
+    """Install an early-close calendar for the duration of a run, then restore the previous state (no leaks
+    between runs or tests). strict=True: the calendar is COMPLETE for the range, so a file that ends at 12:59 on a
+    day the calendar calls a full day is a data gap, not a half day."""
+    saved = (dict(EARLY_CLOSES), dict(CAL_STATE))
+    EARLY_CLOSES.clear()
+    EARLY_CLOSES.update(early)
+    CAL_STATE.update(strict=strict, source=source or CAL_STATE["source"])
+    try:
+        yield
+    finally:
+        EARLY_CLOSES.clear()
+        EARLY_CLOSES.update(saved[0])
+        CAL_STATE.clear()
+        CAL_STATE.update(saved[1])
 
 
 def session_close_bar(day: str, m: pd.DataFrame) -> tuple[int | None, str]:
     """START time of the bar whose close we exit on: one bar before the official close (15:58 bar -> 15:59).
 
-    With an early-close calendar entry it is exact. Without one the close is inferred from the last bar in the
-    file: 15:59 -> full day, 12:59 -> half day. Anything else = a data gap; the day is skipped, never guessed.
+    With an early-close calendar entry it is exact (and the file must reach the bar before the close, else it is a
+    data gap). Without one the close is inferred from the last bar in the file: 15:59 -> full day, 12:59 -> half
+    day (only when no complete calendar is loaded). Anything else = a data gap; the day is skipped, never guessed.
     """
-    if day in EARLY_CLOSES:
-        return hm(EARLY_CLOSES[day]) - 2, "calendar"
     last = int(m["tmin"].max())
+    if day in EARLY_CLOSES:
+        close_bar = hm(EARLY_CLOSES[day]) - 1
+        if last < close_bar:
+            return None, "data_gap"
+        return close_bar - 1, "calendar"
     if last >= hm("15:59"):
         return hm("15:58"), "full"
-    if last == hm("12:59"):
+    if last == hm("12:59") and not CAL_STATE["strict"]:
         return hm("12:58"), "half_inferred"
     return None, "data_gap"
 
@@ -428,8 +500,8 @@ def entry_trigger(r, side: int, k: Knobs) -> float:
 
 def _trades_df(rows: list[dict]) -> pd.DataFrame:
     out = pd.DataFrame(rows).reindex(columns=TRADE_COLS)
-    out["filled"] = out["filled"].fillna(False).astype(bool)
-    out["same_bar_stop"] = out["same_bar_stop"].fillna(False).astype(bool)
+    for c in ("filled", "same_bar_stop"):     # all-NaN columns are float: map NaN -> False without fillna(False)
+        out[c] = out[c].astype(object).where(out[c].notna(), False).astype(bool)
     return out
 
 
@@ -451,17 +523,31 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
             continue
         otd, dfd = ot_by_day[day], dfe_by_day[day]
         m = None
+        merged: dict[int, pd.DataFrame] = {}      # per OR length: the ot x daily-features join, once per day
+        cands: dict[tuple, pd.DataFrame] = {}     # per candidate_key: the candidates, once per day
+        full = None
+
+        def cand_for(kk: Knobs) -> pd.DataFrame:
+            key = candidate_key(kk)
+            if key not in cands:
+                if kk.or_minutes not in merged:
+                    merged[kk.or_minutes] = otd[otd["L"] == kk.or_minutes].merge(
+                        dfd.rename(columns={"date": "day"}), on=["ticker", "day"], how="inner")
+                cands[key] = day_candidates(otd, dfd, kk, merged[kk.or_minutes])
+            return cands[key]
+
         for si, (var, null_mode, seed) in enumerate(specs):
             k = var.knobs
             rng = np.random.default_rng(seed + int(day.replace("-", "")))
-            real = day_candidates(otd, dfd, k)
+            real = cand_for(k)
             if null_mode == "random_names":
                 if real.empty:
                     continue
                 if m is None:
                     m = load_minutes(path)
-                full = set(m.groupby("ticker")["tmin"].max().loc[lambda s: s >= FULL_DAY_MIN_LAST_BAR].index)
-                pool = day_candidates(otd, dfd, replace(k, rvol_min=-1.0, top_n=10_000))
+                if full is None:
+                    full = set(m.groupby("ticker")["tmin"].max().loc[lambda s: s >= FULL_DAY_MIN_LAST_BAR].index)
+                pool = cand_for(replace(k, rvol_min=-1.0, top_n=10_000))
                 pool = pool[pool["ticker"].isin(full)]
                 diag["null_pool_sizes"].append(len(pool))
                 cand = pool.sample(n=min(len(real), len(pool)), random_state=int(rng.integers(1 << 31)))
@@ -485,7 +571,7 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
                     diag["days_skipped_data_gap"].append(day)
                 continue
             if "_mb" not in diag or diag["_mb"][0] != day:
-                diag["_mb"] = (day, {tk: g for tk, g in m.groupby("ticker")})
+                diag["_mb"] = (day, {tk: Bars(g) for tk, g in m.groupby("ticker")})
             mb = diag["_mb"][1]
             start_t = OPEN_MIN + (2 if k.entry_bar2 else 1) * k.or_minutes
             for _, r in cand.iterrows():
@@ -501,11 +587,11 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
                 other = r["l"] if side > 0 else r["h"]
                 tl = (lambda mnt, _d=day, _s=r["ticker"]: TICKS.get((_d, _s, mnt))) if TICKS else None
                 if null_mode == "random_entry":
-                    mins = bars["tmin"][(bars["tmin"] >= start_t) & (bars["tmin"] <= hm("10:30"))].to_numpy()
+                    mins = bars.t[(bars.t >= start_t) & (bars.t <= hm("10:30"))]
                     if mins.size == 0:
                         continue
                     t0 = int(rng.choice(mins))
-                    op = float(bars.loc[bars["tmin"] == t0, "o"].iloc[0])
+                    op = float(bars.o[bars.t == t0][0])
                     trig = op - side * TICK    # level just through the open -> fills at the open
                     res = simulate_trade(bars, side, trig, r["atr14"], k, t0, close_t, other)
                 else:
@@ -517,9 +603,25 @@ def run_many(specs: list[tuple[Variant, str, int]], files: dict[str, str], ot: p
                 d = asdict(res)
                 d.update(day=day, ticker=r["ticker"], side=side, rvol=r["rvol"], atr14=r["atr14"],
                          reason=res.exit_reason)
+                if side < 0:
+                    d.update(ssr=ssr_at_entry(bars, res.entry_t, r), etb=BORROW.get(r["ticker"], np.nan))
                 out_rows[si].append(d)
     diag.pop("_mb", None)
     return [_trades_df(r) for r in out_rows]
+
+
+def ssr_at_entry(bars: "Bars", entry_t: int, r) -> bool:
+    """True if Rule 201 is active when the short entry triggers: carried from the prior session, or any bar from
+    09:30 up to AND including the entry bar traded <= 90% of the prior close (inclusive = pessimistic: inside the
+    entry minute the order of trigger and SSR is unknown). Under SSR a short may only print ABOVE the national
+    best bid, so the modelled stop-market short entry is not executable as modelled."""
+    if bool(r.get("ssr_carry", False)):
+        return True
+    pc = r.get("prev_close_t", np.nan)
+    if not np.isfinite(pc):
+        return False
+    lows = bars.l[bars.t <= entry_t]
+    return bool(lows.size and lows.min() <= 0.9 * pc)
 
 
 def run_variant(var: Variant, files: dict[str, str], ot: pd.DataFrame, dfe: pd.DataFrame,
@@ -559,13 +661,7 @@ def daily_paired_nw(var_tr: pd.DataFrame, base_tr: pd.DataFrame, all_days: list[
     Days with no trades count as 0. Newey-West SE with `lags` lags. Returns a two-sided normal p."""
     from scipy import stats
 
-    def dsum(tr):
-        if tr is None or tr.empty:
-            return pd.Series(0.0, index=all_days)
-        f = tr[tr["filled"]]
-        return f.groupby("day")["r_net"].sum().reindex(all_days, fill_value=0.0)
-
-    d = (dsum(var_tr) - dsum(base_tr)).to_numpy()
+    d = (daily_R(var_tr, all_days) - daily_R(base_tr, all_days)).to_numpy()
     n = len(d)
     if n < 10:
         return {"d_day": np.nan, "t_nw": np.nan, "p": np.nan}
@@ -591,7 +687,27 @@ def holm(pvals: list[float]) -> list[float]:
     return adj
 
 
-def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
+def daily_R(tr: pd.DataFrame | None, all_days: list[str]) -> pd.Series:
+    """Sum of net R per day (equal $ risk per trade); days without trades = 0."""
+    if tr is None or tr.empty or not tr["filled"].any():
+        return pd.Series(0.0, index=all_days)
+    f = tr[tr["filled"]]
+    return f.groupby("day")["r_net"].sum().reindex(all_days, fill_value=0.0)
+
+
+def daily_ret_1x(tr: pd.DataFrame | None, all_days: list[str], top_n: int) -> pd.Series:
+    """1x portfolio daily return: equal notional 1/top_n per position; days without trades = 0."""
+    if tr is None or tr.empty or not tr["filled"].any():
+        return pd.Series(0.0, index=all_days)
+    f = tr[tr["filled"]]
+    return (f.groupby("day")["ret_net"].sum() / top_n).reindex(all_days, fill_value=0.0)
+
+
+REPLICATION_SHARPE_MIN = 2.0   # prereg rev 3 "Sanity gate on B0-replication over DEV"
+SCRATCH_R = 0.05   # |net R| <= this = a scratch (neither win nor loss); proposal, team to confirm
+
+
+def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int, scratch_r: float = SCRATCH_R) -> dict:
     f = tr[tr["filled"]] if not tr.empty and "filled" in tr else tr.head(0)
     out = {"signals": int(len(tr)), "trades": int(len(f))}
     if f.empty:
@@ -612,9 +728,14 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
         ambiguous_resolved_by_ticks=float((f["same_bar_source"] == "ticks").sum()
                                           / max(1, (f["same_bar_source"].fillna("") != "").sum())),
         cost_R=(f["r_gross"] - f["r_net"]).mean(),
+        # scratches reported apart: a breakeven exit nets ~0 after costs and is neither a win nor a loss
+        scratch_pct=float((r.abs() <= scratch_r).mean()),
+        win_pct_ex_scratch=float((r > scratch_r).mean()),
+        loss_pct_ex_scratch=float((r < -scratch_r).mean()),
+        scratch_sum_R=float(r[r.abs() <= scratch_r].sum()),
     )
     # 1x portfolio: equal notional 1/top_n per position, days without trades = 0
-    daily = (f.groupby("day")["ret_net"].sum() / top_n).reindex(all_days, fill_value=0.0)
+    daily = daily_ret_1x(tr, all_days, top_n)
     sd = daily.std(ddof=1)
     out["sharpe_1x"] = daily.mean() / sd * math.sqrt(252) if sd > 0 else np.nan
     out["ann_ret_1x"] = daily.mean() * 252
@@ -637,38 +758,146 @@ def summarize(tr: pd.DataFrame, all_days: list[str], top_n: int) -> dict:
     pos = np.sort(r[r > 0].to_numpy())[::-1]
     top = max(1, int(math.ceil(0.05 * len(r))))
     out["top5pct_share_of_wins"] = float(pos[:top].sum() / pos.sum()) if pos.sum() > 0 else np.nan
+    # pass gate item 6: still positive with the 5 tickers that earned the most net R removed
+    if "ticker" in f:
+        top5 = f.groupby("ticker")["r_net"].sum().nlargest(5).index
+        rest = f[~f["ticker"].isin(top5)]["r_net"]
+        out["mean_R_net_ex_top5_tickers"] = float(rest.mean()) if len(rest) else np.nan
+    else:
+        out["mean_R_net_ex_top5_tickers"] = np.nan          # no ticker column -> unknown (fails the gate closed)
     out["exit_mix"] = f["reason"].value_counts(normalize=True).round(3).to_dict()
     return out
 
 
 BE_TICKS = [0, 1, 2, 3, 4]
+BE_BPS = [0.0, 2.5, 5.0, 10.0, 20.0, 40.0]
 
 
-def breakeven_specs(var: Variant) -> list[tuple[Variant, str, int]]:
+def breakeven_specs(var: Variant, unit: str = "ticks") -> list[tuple[Variant, str, int]]:
+    """Copies of `var` with slippage per side = x ticks (slip_bp off) or x bp (slip_ticks off)."""
+    if unit == "bp":
+        return [(Variant(var.id, replace(var.knobs, slip_ticks=0.0, slip_bp=x)), "", 0) for x in BE_BPS]
     return [(Variant(var.id, replace(var.knobs, slip_ticks=kt, slip_bp=0.0)), "", 0) for kt in BE_TICKS]
 
 
-def breakeven_from(results: list[pd.DataFrame]) -> float:
-    """Extra slippage per side (ticks, on top of commission + half spread) at which mean net R = 0.
-    Interpolates over k = 0..4 ticks (slip_bp off). np.inf if still positive at 4 ticks."""
-    xs, ys = [], []
-    for kt, s in zip(BE_TICKS, results):
+def breakeven_from(results: list[pd.DataFrame], xs: list[float] | None = None) -> float:
+    """Extra slippage per side (on top of commission + half spread) at which mean net R = 0, interpolated
+    linearly over the grid `xs` (default BE_TICKS = 0..4 ticks; BE_BPS for basis points).
+    0 if already <= 0 with no slippage; np.inf if still positive at the top of the grid."""
+    xs_grid = BE_TICKS if xs is None else xs
+    xs_, ys = [], []
+    for kt, s in zip(xs_grid, results):
         f = s[s["filled"]]
         if f.empty:
             return np.nan
-        xs.append(kt)
+        xs_.append(kt)
         ys.append(f["r_net"].mean())
     ys = np.array(ys)
     if ys[0] <= 0:
         return 0.0
-    for i in range(1, len(xs)):
+    for i in range(1, len(xs_)):
         if ys[i] <= 0:
-            return xs[i - 1] + ys[i - 1] / (ys[i - 1] - ys[i]) * (xs[i] - xs[i - 1])
+            return xs_[i - 1] + ys[i - 1] / (ys[i - 1] - ys[i]) * (xs_[i] - xs_[i - 1])
     return np.inf
+
+
+# ----------------------------------------------------------------------------- short shadow
+def short_shadow_summary(tr: pd.DataFrame, all_days: list[str], top_n: int, a) -> dict:
+    """Backtest-only short shadow (prereg: B0-primary is long-only; shorts are a shadow with SSR/ETB flags).
+    Rows: all shorts; without SSR-flagged entries (not executable as modelled); ETB-only (TODAY's list);
+    borrow stress (bp/yr on notional for the holding day) with non-ETB names skipped."""
+    s = summarize(tr, all_days, top_n, a.scratch_r)
+    f = tr[tr["filled"]] if not tr.empty else tr
+    s["sets"] = []
+    if f.empty:
+        return s
+
+    def row(name, x):
+        t, _, G_ = clustered_t(x["r_net"], x["day"]) if len(x) else (np.nan, np.nan, 0)
+        return dict(set=name, trades=int(len(x)), mean_R_net=x["r_net"].mean() if len(x) else np.nan, t=t,
+                    win=float((x["r_net"] > 0).mean()) if len(x) else np.nan)
+
+    ssr = f["ssr"].fillna(False).astype(bool)
+    etb = f["etb"]
+    s["ssr_share"] = float(ssr.mean())
+    s["etb_known_share"] = float(etb.notna().mean())
+    s["sets"].append(row("all shorts", f))
+    s["sets"].append(row("without SSR-flagged entries", f[~ssr]))
+    if etb.notna().any():
+        ok = f[(~ssr) & (etb == True)].copy()                    # noqa: E712 (object column: True/False/NaN)
+        s["sets"].append(row("without SSR, easy-to-borrow only (today's list)", ok))
+        ok["r_net"] = ok["r_net"] - a.borrow_bp_yr / 1e4 / 360 * ok["entry_px"].abs() / ok["r_ps"]
+        s["sets"].append(row(f"same + borrow stress {a.borrow_bp_yr:g} bp/yr", ok))
+    else:
+        x = f[~ssr].copy()
+        x["r_net"] = x["r_net"] - a.borrow_bp_yr / 1e4 / 360 * x["entry_px"].abs() / x["r_ps"]
+        s["sets"].append(row(f"without SSR + borrow stress {a.borrow_bp_yr:g} bp/yr (ETB unknown)", x))
+    return s
+
+
+# ----------------------------------------------------------------------------- gate statistics
+def gate_statistics(variants: list[Variant], results: list[pd.DataFrame], idx: dict, rows: list[dict],
+                    all_days: list[str], a, extra_trials=()) -> dict:
+    """DSR (per version, N from the trial log + this run), random-skip null (filters), Hansen SPA (best vs base),
+    PBO via CSCV (all versions). Writes dsr / rs_* into `rows` (the summary) and returns the run-level numbers."""
+    import gate_stats as G
+    prev = []
+    if os.path.exists(a.trial_log):
+        log = pd.read_csv(a.trial_log, dtype=str)
+        prev = log["sharpe_1x"].tolist() if "sharpe_1x" in log else [""] * len(log)
+    n_trials, var_sr = G.trial_sharpe_stats(prev, [s.get("sharpe_1x", "") for s in rows] + list(extra_trials))
+    sr0 = G.expected_max_sharpe(n_trials, var_sr)
+    base_tr = results[idx[("var", variants[0].id)]]
+    bf = base_tr[base_tr["filled"]] if not base_tr.empty else base_tr
+    dR = {}
+    for i, (v, s) in enumerate(zip(variants, rows)):
+        tr = results[idx[("var", v.id)]]
+        d = G.deflated_sharpe(daily_ret_1x(tr, all_days, v.knobs.top_n).to_numpy(), n_trials, var_sr)
+        s["dsr"] = d["dsr"]
+        dR[v.id] = daily_R(tr, all_days).to_numpy()
+        if i > 0 and not bf.empty:
+            vf = tr[tr["filled"]] if not tr.empty else tr
+            s.update(G.random_skip_null(bf["r_net"].to_numpy(), vf["r_net"].to_numpy() if not vf.empty else [],
+                                        bf["day"].to_numpy(), int(vf["day"].nunique()) if not vf.empty else 0,
+                                        reps=a.gate_reps, seed=a.seed + i))
+    out = dict(n_trials=n_trials, var_sr=var_sr, sr0_day=sr0)
+    if len(variants) > 1:
+        ids = [v.id for v in variants[1:]]
+        diff = np.column_stack([dR[i] - dR[variants[0].id] for i in ids])
+        sp = G.spa_test(diff, reps=a.gate_reps, mean_block=a.spa_block, seed=a.seed)
+        out.update(spa_p=sp["spa_p"], spa_best=ids[sp["spa_best"]] if sp["spa_best"] is not None else None)
+        pb = G.pbo_cscv(np.column_stack([dR[v.id] for v in variants]), a.pbo_blocks)
+        out.update(pbo=pb["pbo"], pbo_splits=pb["splits"], pbo_blocks=pb["blocks"])
+    return out
+
+
+def base_market_exposure(base_tr, all_days: list[str], k: Knobs, daily: pd.DataFrame, ot: pd.DataFrame) -> dict:
+    """Plan v3 §5: the base's daily P&L vs SPY open -> close, and on F8's red-signal days (beta_b.py)."""
+    import beta_b
+    spy = daily[daily["ticker"] == "SPY"].set_index("date")
+    oc = (spy["close"] / spy["open"] - 1).reindex(all_days)
+    so = ot[(ot["ticker"] == "SPY") & (ot["L"] == k.or_minutes)].set_index("day")["c"] if not ot.empty \
+        else pd.Series(dtype=float)
+    prev = pd.Series(SPY_PREV, dtype=float)
+    sig = np.sign(so.reindex(all_days) - prev.reindex(all_days))
+    return beta_b.market_exposure(daily_ret_1x(base_tr, all_days, k.top_n).to_numpy(),
+                                  daily_R(base_tr, all_days).to_numpy(), oc.to_numpy(), sig.to_numpy())
 
 
 # ----------------------------------------------------------------------------- main
 def main(argv=None):
+    """Run, then restore the module-level calendar state (EARLY_CLOSES / CAL_STATE) whatever happens."""
+    saved = (dict(EARLY_CLOSES), dict(CAL_STATE))
+    try:
+        return _main(argv)
+    finally:
+        EARLY_CLOSES.clear()
+        EARLY_CLOSES.update(saved[0])
+        CAL_STATE.clear()
+        CAL_STATE.update(saved[1])
+
+
+def _main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--daily", required=True)
     ap.add_argument("--minutes", required=True)
@@ -677,16 +906,39 @@ def main(argv=None):
     ap.add_argument("--end", default="2023-12-31")
     ap.add_argument("--open-holdout", action="store_true", help="allow dates >= 2024-01-01 (ONE run, logged)")
     ap.add_argument("--nulls", type=int, default=20, help="null repetitions per null type (baseline only)")
+    ap.add_argument("--nulls-all-versions", action="store_true",
+                    help="run the nulls for EVERY version, not only the base (holdout pass gate item 3 needs them "
+                         "for each promoted version; runtime grows with the number of versions)")
     ap.add_argument("--breakeven", action="store_true", help="compute breakeven slippage for every variant (5x runtime)")
     ap.add_argument("--stress", action="store_true", help="also run every variant at 2x slippage")
     ap.add_argument("--out", default="runs")
     ap.add_argument("--trial-log", default="experiments/trials.csv")
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--early-closes", default=None, help="CSV date,close (e.g. 2019-11-29,13:00)")
+    ap.add_argument("--early-closes", default="auto",
+                    help="'auto' (default) = bundled NYSE calendar (nyse_calendar.py) when the range is inside "
+                         "2015-2023; a CSV path date,close (e.g. 2019-11-29,13:00) = a complete calendar; "
+                         "'none' = infer half days from the last bar")
     ap.add_argument("--ticks", default=None, help="ticks.csv from `fetch_b_data.py ticks`: resolves same-minute "
                                                   "entry+stop trades from real prints")
+    ap.add_argument("--securities", default=None, help="securities.csv from fetch_b_data.py assets: TODAY's "
+                                                       "easy_to_borrow flags label the short shadow")
+    ap.add_argument("--no-short-shadow", action="store_true", help="skip the backtest-only short shadow of the base")
+    ap.add_argument("--replication", action="store_true",
+                    help="also run B0-replication (base rules, long + short, commission only) for the prereg sanity "
+                         "gate: gross Sharpe >= 2.0 over DEV, else suspect data or code. A code check, never a verdict")
+    ap.add_argument("--borrow-bp-yr", type=float, default=30.0, help="borrow stress for the short shadow, bp/year")
+    ap.add_argument("--scratch-r", type=float, default=SCRATCH_R, help="|net R| <= this counts as a scratch")
+    ap.add_argument("--gate-reps", type=int, default=1000, help="bootstrap / random-skip repetitions (DSR/SPA/PBO)")
+    ap.add_argument("--spa-block", type=float, default=10.0, help="mean block length (days) of the SPA bootstrap")
+    ap.add_argument("--pbo-blocks", type=int, default=16, help="CSCV blocks for PBO (even)")
     a = ap.parse_args(argv)
     TICKS.clear()
+    BORROW.clear()
+    if a.securities:
+        sec = pd.read_csv(a.securities, dtype={"ticker": str})
+        if "easy_to_borrow" in sec:
+            ok = sec["easy_to_borrow"].notna()
+            BORROW.update(dict(zip(sec.loc[ok, "ticker"], sec.loc[ok, "easy_to_borrow"].astype(str).str.lower() == "true")))
     if a.ticks:
         print(f"ticks loaded for {load_ticks(a.ticks)} ambiguous minutes", flush=True)
 
@@ -706,9 +958,22 @@ def main(argv=None):
                          "A second look needs a new preregistration (v2) and a fresh holdout period.")
         if len(variants) > 3:
             sys.exit("HOLDOUT GUARD: at most base + 2 promoted variants may run on the holdout.")
-    if a.early_closes:
+    holiday_days: set[str] = set()
+    EARLY_CLOSES.clear()
+    if a.early_closes == "auto":
+        import nyse_calendar as NC
+        if NC.COVERED[0] <= int(a.start[:4]) and int(a.end[:4]) <= NC.COVERED[1]:
+            EARLY_CLOSES.update(NC.early_close_map(a.start, a.end))
+            holiday_days = NC.holiday_set(a.start, a.end)
+            CAL_STATE.update(strict=True, source=f"bundled {NC.COVERED[0]}-{NC.COVERED[1]} (nyse_calendar.py)")
+        else:
+            CAL_STATE.update(strict=False, source="none: range outside 2015-2023, half days inferred from the last bar")
+    elif a.early_closes and a.early_closes != "none":
         ec = pd.read_csv(a.early_closes, dtype=str)
         EARLY_CLOSES.update(dict(zip(pd.to_datetime(ec.iloc[:, 0]).dt.strftime("%Y-%m-%d"), ec.iloc[:, 1])))
+        CAL_STATE.update(strict=True, source=f"file {a.early_closes}")
+    else:
+        CAL_STATE.update(strict=False, source="none (half days inferred from the last bar)")
 
     files = {d: p for d, p in minute_files(a.minutes).items()}
     # history needs days before --start for the 14-day baselines; trading only inside [start, end]
@@ -720,6 +985,7 @@ def main(argv=None):
     daily = load_daily(a.daily)
     dfe = daily_features(daily, hist)
     spy = daily[daily["ticker"] == "SPY"].sort_values("date")
+    SPY_PREV.clear()                      # module state: never carry a previous run's SPY closes into this one
     SPY_PREV.update(dict(zip(spy["date"].iloc[1:], spy["close"].iloc[:-1])))
     ot = opening_table({d: p for d, p in files.items() if d <= a.end}, or_lens)
     ot = add_rvol(ot, dfe, hist, variants[0].knobs.min_hist_days)
@@ -750,18 +1016,35 @@ def main(argv=None):
         if a.breakeven:
             for kt, sp in zip(BE_TICKS, breakeven_specs(v)):
                 add(("be", v.id, kt), sp)
+            for x, sp in zip(BE_BPS, breakeven_specs(v, "bp")):
+                if x == 0:
+                    continue                      # identical to 0 ticks: reuse that run
+                add(("be_bp", v.id, x), sp)
+    shadow_id = variants[0].id + "__shadow_short"
+    if not a.no_short_shadow and variants[0].knobs.sides == "long":
+        add(("shadow_short",), (Variant(shadow_id, replace(variants[0].knobs, sides="short"),
+                                        "backtest-only short shadow of the base (never a verdict)"), "", 0))
+    repl_id = variants[0].id + "__replication"
+    if a.replication:
+        add(("replication",), (Variant(repl_id, replace(variants[0].knobs, sides="both", half_spread_bp=0.0,
+                                                        slip_ticks=0.0, slip_bp=0.0),
+                                       "B0-replication: long+short, commission only (code check, never a verdict)"),
+                               "", 0))
     for mode in (["random_entry", "random_names"] if a.nulls > 0 else []):
         for rep in range(a.nulls):
             add(("null", mode, rep), (variants[0], mode, a.seed + 1000 * rep))
+            for v in (variants[1:] if a.nulls_all_versions else []):
+                add(("null", mode, rep, v.id), (v, mode, a.seed + 1000 * rep))
     print(f"running {len(specs)} specs over {len(trade_files)} days (each day file read once)", flush=True)
-    diag: dict = {}
+    diag: dict = {"calendar": CAL_STATE["source"], "holiday_files": sorted(set(trade_files) & holiday_days),
+                  "early_closes_in_range": sorted(d for d in EARLY_CLOSES if d in trade_files)}
     results = run_many(specs, trade_files, ot, dfe, diag)
 
     rows, all_tr = [], []
     base_tr = results[idx[("var", variants[0].id)]]
     for i, v in enumerate(variants):
         tr = results[idx[("var", v.id)]]
-        s = summarize(tr, all_days, v.knobs.top_n)
+        s = summarize(tr, all_days, v.knobs.top_n, a.scratch_r)
         s.update(id=v.id, note=v.note)
         if i > 0:
             pdlt = paired_delta(tr, base_tr)
@@ -770,6 +1053,8 @@ def main(argv=None):
             s["dR_per_day_vs_base"], s["t_nw_vs_base"], s["p_vs_base"] = nw["d_day"], nw["t_nw"], nw["p"]
         if a.breakeven:
             s["breakeven_ticks"] = breakeven_from([results[idx[("be", v.id, kt)]] for kt in BE_TICKS])
+            s["breakeven_bp"] = breakeven_from(
+                [results[idx[("be", v.id, 0) if x == 0 else ("be_bp", v.id, x)]] for x in BE_BPS], BE_BPS)
         if a.stress:
             fs = results[idx[("stress", v.id)]]
             fs = fs[fs["filled"]]
@@ -783,19 +1068,37 @@ def main(argv=None):
         print(f"[{v.id}] trades={s.get('trades', 0)} meanR_net={s.get('mean_R_net', float('nan')):.3f} "
               f"t={s.get('t_net', float('nan')):.2f}", flush=True)
 
+    shadow = None
+    if ("shadow_short",) in idx:
+        sh_tr = results[idx[("shadow_short",)]]
+        shadow = short_shadow_summary(sh_tr, all_days, variants[0].knobs.top_n, a)
+        shadow["id"] = shadow_id
+        all_tr.append(sh_tr.assign(variant=shadow_id))
+    repl = None
+    if ("replication",) in idx:
+        rp_tr = results[idx[("replication",)]]
+        repl = summarize(rp_tr, all_days, variants[0].knobs.top_n, a.scratch_r)
+        repl.update(id=repl_id, note="B0-replication sanity (code check)")
+        repl["pass"] = bool(np.isfinite(repl.get("sharpe_1x", np.nan)) and repl["sharpe_1x"] >= REPLICATION_SHARPE_MIN)
+        all_tr.append(rp_tr.assign(variant=repl_id))
+    extra = ([shadow.get("sharpe_1x", "")] if shadow else []) + ([repl.get("sharpe_1x", "")] if repl else [])
+    gate = gate_statistics(variants, results, idx, rows, all_days, a, extra_trials=extra)
+    gate["replication"] = repl
+
     null_rows = []
     if a.nulls > 0:
-        for mode in ["random_entry", "random_names"]:
-            means = []
-            for rep in range(a.nulls):
-                ntr = results[idx[("null", mode, rep)]]
-                f = ntr[ntr["filled"]]
-                means.append(f["r_net"].mean() if not f.empty else np.nan)
-            means = np.array(means, dtype=float)
-            real = rows[0].get("mean_R_net", np.nan)
-            null_rows.append(dict(null=mode, reps=a.nulls, null_mean=np.nanmean(means),
-                                  null_p95=np.nanpercentile(means, 95), real=real,
-                                  share_null_ge_real=float(np.nanmean(means >= real))))
+        for vi, v in enumerate(variants if a.nulls_all_versions else variants[:1]):
+            for mode in ["random_entry", "random_names"]:
+                means = []
+                for rep in range(a.nulls):
+                    ntr = results[idx[("null", mode, rep) if vi == 0 else ("null", mode, rep, v.id)]]
+                    f = ntr[ntr["filled"]]
+                    means.append(f["r_net"].mean() if not f.empty else np.nan)
+                means = np.array(means, dtype=float)
+                real = rows[vi].get("mean_R_net", np.nan)
+                null_rows.append(dict(null=mode, reps=a.nulls, null_mean=np.nanmean(means),
+                                      null_p95=np.nanpercentile(means, 95), real=real,
+                                      share_null_ge_real=float(np.nanmean(means >= real)), version=v.id))
 
     summ = pd.DataFrame(rows)
     if "p_vs_base" in summ:
@@ -806,13 +1109,34 @@ def main(argv=None):
     with open(os.path.join(outdir, "config.json"), "w") as f:
         json.dump(dict(args=vars(a), variants=[dict(id=v.id, knobs=asdict(v.knobs), note=v.note) for v in variants],
                        data_fingerprint=fp), f, indent=2)
-    write_report(outdir, summ, null_rows, base_tr, a, fp, diag)
+    import gate_stats as G
+    cones = {}
+    for i, v in enumerate(variants):
+        tr = results[idx[("var", v.id)]]
+        f = tr[tr["filled"]] if not tr.empty else tr
+        fo = f.sort_values(["day", "entry_t"]) if not f.empty else f
+        cones[v.id] = dict(
+            day_block=G.expected_cone(fo["r_net"].to_numpy() if not fo.empty else [], seed=a.seed + i,
+                                      days=fo["day"].to_numpy() if not fo.empty else []),
+            iid=G.expected_cone(f["r_net"].to_numpy() if not f.empty else [], seed=a.seed + i))
+    with open(os.path.join(outdir, "expected_cone.json"), "w") as f:
+        json.dump(dict(run=stamp, data_fingerprint=fp, start=a.start, end=a.end, versions=cones), f, indent=2)
+    gate["beta"] = base_market_exposure(base_tr, all_days, variants[0].knobs, daily, ot)
+    gate["cone_base"] = cones[variants[0].id]["day_block"]
+    gate["cone_base_iid"] = cones[variants[0].id]["iid"]
+    gate["shadow"] = shadow
+    with open(os.path.join(outdir, "gate.json"), "w") as f:          # run-level gate numbers for gate_b.py
+        json.dump({k_: gate.get(k_) for k_ in ("n_trials", "var_sr", "sr0_day", "spa_p", "spa_best", "pbo",
+                                                "pbo_splits", "pbo_blocks", "beta")} | {"nulls": null_rows, "replication": (
+            {k_: repl.get(k_) for k_ in ("trades", "sharpe_1x", "mean_R_net", "pass")} if repl else None)},
+                  f, indent=2, default=float)
+    write_report(outdir, summ, null_rows, base_tr, a, fp, diag, gate)
     os.makedirs(os.path.dirname(a.trial_log) or ".", exist_ok=True)
     new = not os.path.exists(a.trial_log)
     with open(a.trial_log, "a") as f:
         if new:
             f.write("run_stamp,variant_id,start,end,trades,mean_R_net,t_net,sharpe_1x,data_fp\n")
-        for s in rows:
+        for s in rows + ([shadow] if shadow else []) + ([repl] if repl else []):   # every backtest run is a trial
             f.write(f"{stamp},{s['id']},{a.start},{a.end},{s.get('trades', 0)},{s.get('mean_R_net', '')},"
                     f"{s.get('t_net', '')},{s.get('sharpe_1x', '')},{fp}\n")
     print(f"\nreport: {os.path.join(outdir, 'report.md')}")
@@ -827,44 +1151,63 @@ def fmt(x, nd=3):
     return str(x)
 
 
-def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None):
+def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None, gate=None):
     diag = diag or {}
-    cols = [("id", "variant"), ("trades", "trades"), ("win_rate", "win%"), ("avg_win_R", "avg win R"),
+    gate = gate or {}
+    cols = [("id", "variant"), ("trades", "trades"), ("win_rate", "win%"),
+            ("win_pct_ex_scratch", "win% ex scratch"), ("scratch_pct", "scratch%"),
+            ("loss_pct_ex_scratch", "loss% ex scratch"), ("avg_win_R", "avg win R"),
             ("avg_loss_R", "avg loss R"), ("mean_R_net", "mean R net"), ("t_net", "t (day-clustered)"),
             ("mean_R_gross", "mean R gross"), ("cost_R", "cost R/trade"), ("profit_factor", "PF"),
             ("pct_pos_months", "% pos months"), ("max_dd_R", "max DD (R)"), ("sharpe_1x", "Sharpe 1x"),
             ("max_dd_1x", "max DD 1x"), ("same_bar_stop_pct", "same-bar stop %"),
             ("ambiguous_pct", "ambiguous entry bars %"), ("ambiguous_resolved_by_ticks", "of which resolved by ticks %"),
-            ("breakeven_ticks", "breakeven ticks/side"), ("mean_R_net_2x_slip", "mean R @2x slip"),
+            ("breakeven_ticks", "breakeven ticks/side"),
+            ("breakeven_bp", "breakeven bp/side"), ("mean_R_net_2x_slip", "mean R @2x slip"),
             ("mean_R_net_ohlc_path", "mean R if same-bar = OHLC path"),
             ("quarters_pos", "quarters +"), ("longest_losing_streak", "longest losing streak"),
             ("top5pct_share_of_wins", "top-5% share of wins"),
+            ("mean_R_net_ex_top5_tickers", "mean R w/o top-5 tickers"),
             ("dR_vs_base", "ΔR/trade vs base"), ("t_vs_base", "t vs base"),
-            ("dR_per_day_vs_base", "ΔR/day vs base"), ("t_nw_vs_base", "t NW (day)"), ("p_holm", "p Holm")]
+            ("dR_per_day_vs_base", "ΔR/day vs base"), ("t_nw_vs_base", "t NW (day)"), ("p_holm", "p Holm"),
+            ("dsr", "DSR"), ("rs_p_trades", "random-skip p (trades)"), ("rs_p_days", "random-skip p (days)")]
     cols = [c for c in cols if c[0] in summ]
     L = [f"# Strategy B backtest {a.start} → {a.end}", "",
          f"Data fingerprint `{fp}`. All numbers are AFTER commission + half spread + slippage unless labelled gross.",
          "Win rate and averages are per trade. Mean R assumes the SAME $ risk per trade; Sharpe and drawdown 1× use",
          "EQUAL NOTIONAL (1/top_n of equity per name). The two sizings differ; read each metric with its own sizing.",
+         f"win% = net R > 0 (old definition). Scratch = |net R| ≤ {a.scratch_r:g}R, reported apart from wins and losses.",
+         "Breakeven slippage = extra slippage per side on top of commission + half spread at which mean net R = 0, "
+         "in ticks (grid 0-4) and in bp (grid 0-40; for a $200 stock 1 tick = 0.5 bp, for a $10 stock 10 bp).",
          "", "| " + " | ".join(c[1] for c in cols) + " |", "|" + "---|" * len(cols)]
     gaps = diag.get("days_skipped_data_gap", [])
     pools = diag.get("null_pool_sizes", [])
-    warn = [f"- Days skipped as data gaps (last bar not 15:59 / 12:59, no calendar entry): {len(gaps)}"
+    warn = [f"- Days skipped as data gaps (last bar does not match the session close): {len(gaps)}"
             + (f" e.g. {gaps[:5]}" if gaps else "")]
+    if "calendar" in diag:
+        hol = diag.get("holiday_files", [])
+        warn.append(f"- NYSE calendar: {diag['calendar']}. Early closes in range: "
+                    f"{len(diag.get('early_closes_in_range', []))}. Minute files on NYSE holidays: {len(hol)}"
+                    + (f" {hol[:5]} (data error: a closed market has no bars)" if hol else ""))
     if pools:
         warn.append(f"- random_names null pool = universe names WITH full-day bars: median {int(np.median(pools))}/day. "
                     "If full-day bars exist only for top-RVOL names, this null is NOT random and H2 is untested "
                     "(data plan: also download full-day bars for a seeded random sample of eligible names).")
     for _, r in summ.iterrows():
-        pct_cols = {"win_rate", "pct_pos_months", "same_bar_stop_pct", "ambiguous_pct", "ambiguous_resolved_by_ticks"}
+        pct_cols = {"win_rate", "win_pct_ex_scratch", "scratch_pct", "loss_pct_ex_scratch", "pct_pos_months", "same_bar_stop_pct", "ambiguous_pct", "ambiguous_resolved_by_ticks"}
         L.append("| " + " | ".join(fmt(r.get(c[0])) if c[0] not in pct_cols
                                    else (f"{100*r.get(c[0]):.1f}" if pd.notna(r.get(c[0])) else "–") for c in cols) + " |")
     L += ["", "## Data diagnostics", ""] + warn
     if null_rows:
         L += ["", "## Nulls (baseline)", "", "| null | reps | null mean R | null p95 | real | share of nulls ≥ real |",
               "|---|---|---|---|---|---|"]
+        many = len({n["version"] for n in null_rows}) > 1
+        if many:
+            L[-2], L[-1] = L[-2].replace("| null |", "| version | null |"), L[-1] + "---|"
+            L[-4] = "## Nulls (every version: same rules, random entry minute / random eligible names)"
         for n in null_rows:
-            L.append(f"| {n['null']} | {n['reps']} | {fmt(n['null_mean'])} | {fmt(n['null_p95'])} | {fmt(n['real'])} | "
+            L.append(("| " + n["version"] + " " if many else "")
+                     + f"| {n['null']} | {n['reps']} | {fmt(n['null_mean'])} | {fmt(n['null_p95'])} | {fmt(n['real'])} | "
                      f"{fmt(n['share_null_ge_real'], 2)} |")
     if base_tr is not None and not base_tr.empty and base_tr["filled"].any():
         f = base_tr[base_tr["filled"]].copy()
@@ -875,6 +1218,69 @@ def write_report(outdir, summ, null_rows, base_tr, a, fp, diag=None):
             L.append(f"| {yr} | {int(rr['count'])} | {rr['mean']:.3f} |")
         if "exit_mix" in summ.columns:
             L += ["", f"Exit mix (baseline): {summ.iloc[0]['exit_mix']}"]
+    if gate:
+        L += ["", "## Gate statistics (multiple testing / overfitting)", "",
+              f"- **Trials in the log (N for the DSR, this run included): {gate['n_trials']}**; cross-trial variance of "
+              f"the daily Sharpe: {fmt(gate['var_sr'], 6)}; expected max daily Sharpe under H0: "
+              f"{fmt(gate['sr0_day'], 4)} (annualised {fmt(gate['sr0_day'] * math.sqrt(252), 2)}).",
+              "- DSR = P(true Sharpe > that expected maximum), on the 1× equal-notional daily returns. Gate: ≥ 0.95.",
+              "- Random-skip p: share of random subsets of the base's trades (same count) or days (same count) whose "
+              "mean net R ≥ the variant's. Only for versions that keep fewer trades than base (filters). Gate: < 0.05.",
+              f"- Hansen SPA (best variant vs base, daily net R, stationary bootstrap, block {a.spa_block:g} d, "
+              f"{a.gate_reps} reps): **p = {fmt(gate.get('spa_p'))}**"
+              + (f", best = `{gate['spa_best']}`" if gate.get("spa_best") else "")
+              + ". p > 0.10 → nothing beats base.",
+              f"- PBO via CSCV ({gate.get('pbo_blocks', 0)} blocks, {gate.get('pbo_splits', 0)} splits, all "
+              f"{len(summ)} versions, daily net R Sharpe): **PBO = {fmt(gate.get('pbo'))}**. > 0.3 → the search is "
+              "overfit."]
+    cone = gate.get("cone_base")
+    if cone and cone.get("horizons"):
+        iid = gate.get("cone_base_iid", {}).get("horizons", {})
+        L += ["", "## Expected cone for paper monitoring (baseline; all versions in expected_cone.json)", "",
+              f"{cone['method']}, {cone['paths']} paths, seed {cone['seed']}, from {cone['source_trades']} trades. "
+              "Net R after all costs. Below p5 or DD above p95 → check the implementation (signals, fills, costs) "
+              "before blaming the market; ABOVE p95 → also investigate.", "",
+              "Primary = day-block (same-day trades move together); the iid cone is shown for comparison.", "",
+              "| after N trades | cum R p5 | p50 | p95 | max DD R p5 | p50 | p95 | iid cum R p5 | iid p95 |",
+              "|---|---|---|---|---|---|---|---|---|"]
+        for h, x in cone["horizons"].items():
+            y = iid.get(h, {}).get("cum_R", [np.nan] * 3)
+            L.append(f"| {h} | " + " | ".join(fmt(v, 2) for v in x["cum_R"] + x["max_dd_R"] + [y[0], y[2]]) + " |")
+    rp = gate.get("replication")
+    if rp:
+        L += ["", "## B0-replication sanity gate (code check, never a verdict)", "",
+              "Base rules, long + short, commission only (no half spread, no slippage); Sharpe on equal notional "
+              "(leverage does not change a Sharpe). Prereg: gross Sharpe ≥ 2.0 over DEV, else suspect data or code.", "",
+              f"Trades {rp.get('trades', 0)}, mean R {fmt(rp.get('mean_R_net'))}, **Sharpe {fmt(rp.get('sharpe_1x'), 2)} → "
+              f"{'PASS' if rp.get('pass') else 'FAIL: check the data and the code before reading anything else'}**. "
+              "Logged as one trial."]
+    be = gate.get("beta") or {}
+    if be.get("days", 0) >= 3 and "beta" in be:
+        L += ["", "## Market exposure of the base (plan v3 §5; diagnostic, not a verdict)", "",
+              f"OLS of the base 1× daily net return on SPY open → close (raw daily bars; B exits at 15:58), "
+              f"{be['days']} days ({be['days_without_spy']} without SPY data left out): **beta = {fmt(be['beta'])}** "
+              f"(NW t {fmt(be['beta_t_nw'], 2)}), corr {fmt(be['corr'])}, alpha {fmt(1e4 * be['alpha_day'], 2)} bp/day.",
+              "", "| SPY day | days | mean base net R/day | t (days) |", "|---|---|---|---|"]
+        for key, lab in (("spy_up", "up (open → close > 0)"), ("spy_down", "down"),
+                         ("spy_worst5pct", "worst 5%"), ("f8_red", "F8 red signal (prior close → OR close < 0)")):
+            if f"n_{key}" in be:
+                L.append(f"| {lab} | {be[f'n_{key}']} | {fmt(be[f'R_day_{key}'])} | {fmt(be[f't_{key}'], 2)} |")
+        if "total_R" in be:
+            L += ["", f"F8 arithmetic on the base's own trades (diagnostic; F8 itself is version "
+                  f"`spy_filter=true`): total {fmt(be['total_R'], 1)} R; skip red-signal days "
+                  f"{fmt(be['total_R_skip_red'], 1)} R; half size on them {fmt(be['total_R_half_red'], 1)} R. "
+                  "Plan v3 §5: F8 helps only if long P&L on red-signal days is negative after costs."]
+    sh = gate.get("shadow")
+    if sh:
+        L += ["", "## Short shadow (backtest only; never a verdict, never traded)", "",
+              f"Base rules with sides = short. SSR-flagged = Rule 201 active at the entry (carried from the prior day, "
+              f"or a print ≤ 90% of the prior close by the entry minute): {fmt(100 * sh.get('ssr_share', np.nan), 1)}% "
+              f"of shorts. ETB flags known for {fmt(100 * sh.get('etb_known_share', np.nan), 1)}% "
+              "(Alpaca's list TODAY, optimistic for the past). Logged as one trial.", "",
+              "| set | trades | mean R net | t (day-clustered) | win% |", "|---|---|---|---|---|"]
+        for x in sh.get("sets", []):
+            L.append(f"| {x['set']} | {x['trades']} | {fmt(x['mean_R_net'])} | {fmt(x['t'], 2)} | "
+                     f"{fmt(100 * x['win'], 1) if np.isfinite(x['win']) else '–'} |")
     L += ["", "## Reading rules", "- Not preregistered yet: treat t < 3 as 'not worth pursuing' (rigor skill §5).",
           "- A variant beats the base only with t_vs_base > 2 AND wins again on the next period's fresh data.",
           "- Breakeven ticks/side < 2 → B as specified does not get deployed (plan §4).",
